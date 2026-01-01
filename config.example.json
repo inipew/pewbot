@@ -1,0 +1,76 @@
+{
+  "telegram": {
+    "token": "YOUR_BOT_TOKEN",
+    "owner_user_ids": [
+      123456789
+    ],
+    "group_log": "-123456789",
+    "poll_timeout_sec": 10
+  },
+  "logging": {
+    "level": "INFO",
+    "console": true,
+    "file": {
+      "enabled": true,
+      "path": "./bot.log"
+    },
+    "telegram": {
+      "enabled": true,
+      "thread_id": 0,
+      "min_level": "INFO",
+      "rate_per_sec": 2
+    }
+  },
+  "scheduler": {
+    "enabled": true,
+    "workers": 4,
+    "default_timeout_ms": 10000,
+    "history_size": 200,
+    "timezone": "Asia/Jakarta"
+  },
+  "broadcaster": {
+    "enabled": true,
+    "workers": 4,
+    "rate_per_sec": 20,
+    "retry_max": 3
+  },
+  "plugins": {
+    "echo": {
+      "enabled": true,
+      "timeout": "25s",
+      "config": {
+        "prefix": "echo: "
+      }
+    },
+    "system": {
+      "enabled": true
+    },
+    "systemd": {
+      "enabled": false,
+      "timeout": "15s",
+      "config": {
+        "prefix": "svc: ",
+        "allow_units": [
+          "sing-box",
+          "caddy",
+          "dnscrypt-proxy"
+        ],
+        "auto_recover": {
+          "enabled": false,
+          "interval": "30s",
+          "min_down": "3s"
+        }
+      }
+    },
+    "speedtest": {
+      "enabled": false,
+      "config": {
+        "prefix": "speedtest: ",
+        "auto_speedtest": {
+          "schedule": "*/30 * * * *"
+        },
+        "history_file": "speedtest_history.json"
+      }
+    }
+  }
+}

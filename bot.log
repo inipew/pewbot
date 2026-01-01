@@ -1,0 +1,90 @@
+{"time":"2026-01-01T12:00:16.9657066+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"system","timeout_ms":0}
+{"time":"2026-01-01T12:00:16.9673325+07:00","level":"INFO","msg":"system plugin started","plugin":"system"}
+{"time":"2026-01-01T12:00:16.9673325+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"echo","timeout_ms":2500}
+{"time":"2026-01-01T12:00:16.9679147+07:00","level":"INFO","msg":"echo plugin started","plugin":"echo"}
+{"time":"2026-01-01T12:00:18.0917962+07:00","level":"INFO","msg":"telegram started","component":"adapter"}
+{"time":"2026-01-01T12:00:18.0924188+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T12:00:28.5352983+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":589287392,"thread_id":0,"sender_id":589287392,"text":"/help"}
+{"time":"2026-01-01T12:00:30.779913+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":589287392,"thread_id":0,"sender_id":589287392,"text":"/sysinfo"}
+{"time":"2026-01-01T12:00:33.7914591+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":589287392,"thread_id":0,"sender_id":589287392,"text":"/plugins"}
+{"time":"2026-01-01T12:00:36.3330417+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":589287392,"thread_id":0,"sender_id":589287392,"text":"/ping"}
+{"time":"2026-01-01T12:00:41.1824973+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":589287392,"thread_id":0,"sender_id":589287392,"text":"/health"}
+{"time":"2026-01-01T12:00:44.0881206+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":589287392,"thread_id":0,"sender_id":589287392,"text":"/echo"}
+{"time":"2026-01-01T12:00:48.9972814+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":589287392,"thread_id":0,"sender_id":589287392,"text":"/echo asasfsdgdgdfg"}
+{"time":"2026-01-01T12:01:08.7458659+07:00","level":"INFO","msg":"stopping..."}
+{"time":"2026-01-01T12:17:40.8265819+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"system","timeout_ms":0}
+{"time":"2026-01-01T12:17:40.8271222+07:00","level":"INFO","msg":"system plugin started","plugin":"system"}
+{"time":"2026-01-01T12:17:40.8277032+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"echo","timeout_ms":2500}
+{"time":"2026-01-01T12:17:40.8277032+07:00","level":"INFO","msg":"echo plugin started","plugin":"echo"}
+{"time":"2026-01-01T12:17:41.7650567+07:00","level":"INFO","msg":"telegram started","component":"adapter"}
+{"time":"2026-01-01T12:17:41.7662639+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T12:18:17.2817972+07:00","level":"INFO","msg":"stopping..."}
+{"time":"2026-01-01T12:18:36.7495613+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"system","timeout_ms":0}
+{"time":"2026-01-01T12:18:36.7506093+07:00","level":"INFO","msg":"system plugin started","plugin":"system"}
+{"time":"2026-01-01T12:18:36.7506093+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"echo","timeout_ms":2500}
+{"time":"2026-01-01T12:18:37.2506064+07:00","level":"INFO","msg":"echo plugin started","plugin":"echo"}
+{"time":"2026-01-01T12:18:38.5112624+07:00","level":"INFO","msg":"telegram started","component":"adapter"}
+{"time":"2026-01-01T12:18:38.5122945+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T12:18:44.9235985+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":589287392,"thread_id":0,"sender_id":589287392,"text":"/ping"}
+{"time":"2026-01-01T12:18:55.746363+07:00","level":"INFO","msg":"stopping..."}
+{"time":"2026-01-01T12:28:17.2026692+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"system","timeout_ms":0}
+{"time":"2026-01-01T12:28:17.2032581+07:00","level":"INFO","msg":"system plugin started","plugin":"system"}
+{"time":"2026-01-01T12:28:17.2038075+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"echo","timeout_ms":2500}
+{"time":"2026-01-01T12:28:17.2038075+07:00","level":"INFO","msg":"echo plugin started","plugin":"echo"}
+{"time":"2026-01-01T12:28:18.0146048+07:00","level":"INFO","msg":"telegram started","component":"adapter"}
+{"time":"2026-01-01T12:28:18.638705+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T12:28:23.8422168+07:00","level":"INFO","msg":"stopping..."}
+{"time":"2026-01-01T12:28:29.0749188+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"system","timeout_ms":0}
+{"time":"2026-01-01T12:28:29.0760576+07:00","level":"INFO","msg":"system plugin started","plugin":"system"}
+{"time":"2026-01-01T12:28:29.07661+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"echo","timeout_ms":2500}
+{"time":"2026-01-01T12:28:29.07661+07:00","level":"INFO","msg":"echo plugin started","plugin":"echo"}
+{"time":"2026-01-01T12:28:29.8361211+07:00","level":"INFO","msg":"telegram started","component":"adapter"}
+{"time":"2026-01-01T12:28:29.8374736+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T12:28:54.5406287+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":-1001999218371,"thread_id":0,"sender_id":589287392,"text":"/help@wth_ger_bot"}
+{"time":"2026-01-01T12:28:57.1202786+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":-1001999218371,"thread_id":0,"sender_id":589287392,"text":"/sysinfo@wth_ger_bot"}
+{"time":"2026-01-01T12:29:19.5614047+07:00","level":"INFO","msg":"stopping..."}
+{"time":"2026-01-01T12:33:48.8211953+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"system","timeout_ms":0}
+{"time":"2026-01-01T12:33:48.8223318+07:00","level":"INFO","msg":"system plugin started","plugin":"system"}
+{"time":"2026-01-01T12:33:48.8230405+07:00","level":"INFO","msg":"enabling plugin","component":"plugins","plugin":"echo","timeout_ms":2500}
+{"time":"2026-01-01T12:33:48.8230405+07:00","level":"INFO","msg":"echo plugin started","plugin":"echo"}
+{"time":"2026-01-01T12:33:50.023793+07:00","level":"INFO","msg":"telegram started","component":"adapter"}
+{"time":"2026-01-01T12:33:50.0249309+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T12:34:12.7554164+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":-1001999218371,"thread_id":0,"sender_id":589287392,"text":"/help@wth_ger_bot"}
+{"time":"2026-01-01T12:35:18.3948079+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":-1001999218371,"thread_id":0,"sender_id":589287392,"text":"/health@wth_ger_bot"}
+{"time":"2026-01-01T12:35:25.2563802+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":-1001999218371,"thread_id":0,"sender_id":589287392,"text":"/sysinfo@wth_ger_bot"}
+{"time":"2026-01-01T12:35:29.8636996+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":-1001999218371,"thread_id":0,"sender_id":589287392,"text":"/ping@wth_ger_bot"}
+{"time":"2026-01-01T12:35:33.7550036+07:00","level":"INFO","msg":"request","adapter":"telegram","chat_id":-1001999218371,"thread_id":0,"sender_id":589287392,"text":"/plugins@wth_ger_bot"}
+{"time":"2026-01-01T12:45:51.6358337+07:00","level":"INFO","msg":"stopping..."}
+{"time":"2026-01-01T14:30:33.8466202+07:00","level":"INFO","msg":"scheduler started","workers":4}
+{"time":"2026-01-01T14:30:34.3980507+07:00","level":"INFO","msg":"broadcaster started","workers":4,"rps":20}
+{"time":"2026-01-01T14:30:34.9073975+07:00","level":"INFO","msg":"plugin started","plugin":"echo"}
+{"time":"2026-01-01T14:30:35.4194809+07:00","level":"INFO","msg":"plugin started","plugin":"system"}
+{"time":"2026-01-01T14:30:35.9315499+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T14:36:58.5396538+07:00","level":"INFO","msg":"scheduler stopped"}
+{"time":"2026-01-01T14:36:59.0164666+07:00","level":"INFO","msg":"broadcaster stopped"}
+{"time":"2026-01-01T14:37:11.2041076+07:00","level":"INFO","msg":"scheduler started","workers":4}
+{"time":"2026-01-01T14:37:11.6341619+07:00","level":"INFO","msg":"broadcaster started","workers":4,"rps":20}
+{"time":"2026-01-01T14:37:12.1234733+07:00","level":"INFO","msg":"plugin started","plugin":"echo"}
+{"time":"2026-01-01T14:37:12.635407+07:00","level":"INFO","msg":"plugin started","plugin":"system"}
+{"time":"2026-01-01T14:37:13.1475526+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T14:37:49.3623091+07:00","level":"INFO","msg":"config reloaded"}
+{"time":"2026-01-01T14:37:50.2098155+07:00","level":"INFO","msg":"scheduler stopped"}
+{"time":"2026-01-01T14:37:50.7297322+07:00","level":"INFO","msg":"broadcaster stopped"}
+{"time":"2026-01-01T14:37:54.3147251+07:00","level":"INFO","msg":"scheduler started","workers":4}
+{"time":"2026-01-01T14:37:54.8270951+07:00","level":"INFO","msg":"broadcaster started","workers":4,"rps":20}
+{"time":"2026-01-01T14:37:55.3371042+07:00","level":"INFO","msg":"plugin started","plugin":"echo"}
+{"time":"2026-01-01T14:37:55.8099351+07:00","level":"INFO","msg":"plugin started","plugin":"system"}
+{"time":"2026-01-01T14:37:56.3110817+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T14:38:09.3679551+07:00","level":"INFO","msg":"request ok","kind":"message","chat_id":-1001999218371,"thread_id":0,"from_id":589287392,"cmd":"sysinfo","dur":411117700}
+{"time":"2026-01-01T14:38:54.0375373+07:00","level":"INFO","msg":"config reloaded"}
+{"time":"2026-01-01T14:39:00.1148829+07:00","level":"INFO","msg":"scheduler stopped"}
+{"time":"2026-01-01T14:39:00.5364329+07:00","level":"INFO","msg":"broadcaster stopped"}
+{"time":"2026-01-01T14:42:53.7390474+07:00","level":"INFO","msg":"scheduler started","workers":4,"tz":"Local"}
+{"time":"2026-01-01T14:42:54.2065212+07:00","level":"INFO","msg":"broadcaster started","workers":4,"rps":20}
+{"time":"2026-01-01T14:42:54.6710084+07:00","level":"INFO","msg":"plugin started","plugin":"system"}
+{"time":"2026-01-01T14:42:55.168992+07:00","level":"INFO","msg":"plugin started","plugin":"echo"}
+{"time":"2026-01-01T14:42:55.681893+07:00","level":"INFO","msg":"app started"}
+{"time":"2026-01-01T14:43:04.3889721+07:00","level":"INFO","msg":"request ok","kind":"message","chat_id":-1001999218371,"thread_id":0,"from_id":589287392,"cmd":"help","dur":514694000}
+{"time":"2026-01-01T14:43:11.6562513+07:00","level":"INFO","msg":"request ok","kind":"message","chat_id":589287392,"thread_id":0,"from_id":589287392,"cmd":"help","dur":614280300}
+{"time":"2026-01-01T14:43:14.3204381+07:00","level":"INFO","msg":"request ok","kind":"message","chat_id":589287392,"thread_id":0,"from_id":589287392,"cmd":"ping","dur":411787100}
+{"time":"2026-01-01T14:43:16.1615981+07:00","level":"INFO","msg":"request ok","kind":"message","chat_id":589287392,"thread_id":0,"from_id":589287392,"cmd":"sysinfo","dur":469984700}

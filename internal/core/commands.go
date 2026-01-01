@@ -1,0 +1,388 @@
+package core
+
+import (
+	"context"
+	"log/slog"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"pewbot/internal/kit"
+)
+
+type Access int
+
+const (
+	AccessEveryone Access = iota
+	AccessOwnerOnly
+)
+
+type Command struct {
+	// Route is a space-separated command path, e.g.:
+	//   "ping"
+	//   "systemd restart"
+	Route       string
+	Aliases     []string // root-level aliases, e.g. ["systemd_restart", "sr"]
+	Description string
+	Usage       string
+	Access      Access
+
+	PluginName string
+	Timeout    time.Duration // optional per-command override
+	Handle     HandlerFunc
+}
+
+type CallbackHandlerFunc func(ctx context.Context, req *Request, payload string) error
+
+type CallbackRoute struct {
+	Plugin      string
+	Action      string
+	Description string
+	Timeout     time.Duration
+	Handle      CallbackHandlerFunc
+}
+
+type Request struct {
+	Update  kit.Update
+	Chat    kit.ChatTarget
+	FromID  int64
+	Path    []string // matched command path tokens (for message updates)
+	Command string   // convenience (route or callback key)
+	Args    []string
+	Payload string // callback payload (raw string)
+
+	Adapter     kit.Adapter
+	Config      *Config
+	Logger      *slog.Logger
+	Services    *Services
+	OwnerUserID []int64
+}
+
+type Services struct {
+	Scheduler   SchedulerPort
+	Broadcaster BroadcasterPort
+	Notifier    NotifierPort
+}
+
+type SchedulerPort interface {
+	AddCron(name, spec string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+	AddInterval(name string, every time.Duration, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+
+	AddDaily(name string, atHHMM string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+	AddWeekly(name string, weekday time.Weekday, atHHMM string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+}
+
+type BroadcasterPort interface {
+	NewJob(name string, targets []kit.ChatTarget, text string, opt *kit.SendOptions) string
+	StartJob(ctx context.Context, jobID string) error
+	Status(jobID string) (any, bool)
+}
+
+type NotifierPort interface {
+	Notify(ctx context.Context, n kit.Notification) error
+}
+
+type CommandManager struct {
+	mu sync.RWMutex
+
+	root  *cmdNode
+	alias map[string]*cmdNode // alias -> leaf node
+
+	cbMu     sync.RWMutex
+	callbacks map[string]map[string]CallbackRoute // plugin -> action -> route
+
+	owners []int64
+
+	log     *slog.Logger
+	adapter kit.Adapter
+	cfgm    *ConfigManager
+	serv    *Services
+
+	jobs chan func()
+}
+
+func NewCommandManager(log *slog.Logger, adapter kit.Adapter, cfgm *ConfigManager, serv *Services, owners []int64) *CommandManager {
+	return &CommandManager{
+		root:      newRoot(),
+		alias:     map[string]*cmdNode{},
+		callbacks: map[string]map[string]CallbackRoute{},
+		log:       log,
+		adapter:   adapter,
+		cfgm:      cfgm,
+		serv:      serv,
+		owners:    owners,
+		jobs:      make(chan func(), 256),
+	}
+}
+
+func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
+	// always inject help
+	helper := Command{
+		Route:       "help",
+		Aliases:     []string{"h"},
+		Description: "show help",
+		Usage:       "/help [cmd] [sub...]",
+		Access:      AccessEveryone,
+		Handle: func(ctx context.Context, req *Request) error {
+			text := m.helpText(req.Args)
+			_, _ = req.Adapter.SendText(ctx, req.Chat, text, &kit.SendOptions{ParseMode: "Markdown", DisablePreview: true})
+			return nil
+		},
+	}
+	cmds = append(cmds, helper)
+
+	root := newRoot()
+	alias := map[string]*cmdNode{}
+
+	for _, c := range cmds {
+		route := splitRoute(c.Route)
+		if len(route) == 0 || c.Handle == nil {
+			continue
+		}
+		cc := c // copy
+		root.add(route, cc)
+
+		leaf := root.find(route)
+		for _, a := range c.Aliases {
+			a = strings.TrimSpace(a)
+			if a == "" || strings.Contains(a, " ") {
+				continue
+			}
+			alias[a] = leaf
+		}
+	}
+
+	cb := map[string]map[string]CallbackRoute{}
+	for _, r := range cbs {
+		p := strings.TrimSpace(r.Plugin)
+		a := strings.TrimSpace(r.Action)
+		if p == "" || a == "" || r.Handle == nil {
+			continue
+		}
+		if cb[p] == nil {
+			cb[p] = map[string]CallbackRoute{}
+		}
+		cb[p][a] = r
+	}
+
+	m.mu.Lock()
+	m.root = root
+	m.alias = alias
+	m.mu.Unlock()
+
+	m.cbMu.Lock()
+	m.callbacks = cb
+	m.cbMu.Unlock()
+}
+
+func (m *CommandManager) DispatchLoop(ctx context.Context, updates <-chan kit.Update) {
+	// bounded worker pool (hemat resource & goroutine safe)
+	workers := runtime.NumCPU()
+	if workers < 2 {
+		workers = 2
+	}
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job := <-m.jobs:
+					job()
+				}
+			}
+		}()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case up := <-updates:
+			m.routeUpdate(ctx, up)
+		}
+	}
+}
+
+func (m *CommandManager) routeUpdate(root context.Context, up kit.Update) {
+	switch up.Kind {
+	case kit.UpdateMessage:
+		m.routeMessage(root, up)
+	case kit.UpdateCallback:
+		m.routeCallback(root, up)
+	}
+}
+
+func (m *CommandManager) routeMessage(root context.Context, up kit.Update) {
+	if up.Message == nil {
+		return
+	}
+	msg := up.Message
+	text := strings.TrimSpace(msg.Text)
+	if !strings.HasPrefix(text, "/") {
+		return
+	}
+
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return
+	}
+	word := strings.TrimPrefix(parts[0], "/")
+	if i := strings.IndexByte(word, '@'); i >= 0 {
+		word = word[:i]
+	}
+	args := []string{}
+	if len(parts) > 1 {
+		args = parts[1:]
+	}
+
+	// snapshot registry
+	m.mu.RLock()
+	rootNode := m.root
+	aliasMap := m.alias
+	m.mu.RUnlock()
+
+	// alias as root-level shortcut
+	if leaf, ok := aliasMap[word]; ok && leaf != nil && leaf.cmd != nil {
+		cmd := *leaf.cmd
+		m.enqueueCommand(root, up, cmd, splitRoute(cmd.Route), args)
+		return
+	}
+
+	// traverse subcommand tree
+	cur, ok := rootNode.child(word)
+	if !ok {
+		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, "unknown command. try /help", nil)
+		return
+	}
+	path := []string{word}
+	for len(args) > 0 {
+		nxt := args[0]
+		child, ok := cur.child(nxt)
+		if !ok {
+			break
+		}
+		cur = child
+		path = append(path, nxt)
+		args = args[1:]
+	}
+
+	// If container node without handler: show help for that path
+	if cur.cmd == nil {
+		txt := m.helpText(path)
+		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, txt, &kit.SendOptions{ParseMode: "Markdown", DisablePreview: true})
+		return
+	}
+
+	cmd := *cur.cmd
+	m.enqueueCommand(root, up, cmd, path, args)
+}
+
+func (m *CommandManager) enqueueCommand(root context.Context, up kit.Update, cmd Command, path []string, args []string) {
+	msg := up.Message
+	if msg == nil {
+		return
+	}
+
+	if cmd.Access == AccessOwnerOnly && !isOwner(msg.FromID, m.owners) {
+		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, "unauthorized", nil)
+		return
+	}
+
+	req := &Request{
+		Update:      up,
+		Chat:        kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID},
+		FromID:      msg.FromID,
+		Path:        path,
+		Command:     cmd.Route,
+		Args:        args,
+		Adapter:     m.adapter,
+		Config:      m.cfgm.Get(),
+		Logger:      m.log,
+		Services:    m.serv,
+		OwnerUserID: m.owners,
+	}
+
+	final := Chain(
+		cmd.Handle,
+		MWPanicRecover(m.log),
+		MWRequestLog(m.log),
+		MWTimeout(cmd.Timeout),
+	)
+
+	select {
+	case m.jobs <- func() { _ = final(root, req) }:
+	default:
+		_, _ = m.adapter.SendText(root, req.Chat, "busy, try again", nil)
+	}
+}
+
+func (m *CommandManager) routeCallback(root context.Context, up kit.Update) {
+	if up.Callback == nil {
+		return
+	}
+	cb := up.Callback
+	data := strings.TrimSpace(cb.Data)
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) < 2 {
+		return
+	}
+	plugin := parts[0]
+	action := parts[1]
+	payload := ""
+	if len(parts) == 3 {
+		payload = parts[2]
+	}
+
+	m.cbMu.RLock()
+	actions := m.callbacks[plugin]
+	route, ok := actions[action]
+	m.cbMu.RUnlock()
+	if !ok {
+		return
+	}
+
+	// Owner check: let plugin enforce if needed (or add in route later)
+	req := &Request{
+		Update:      up,
+		Chat:        kit.ChatTarget{ChatID: cb.ChatID, ThreadID: cb.ThreadID},
+		FromID:      cb.FromID,
+		Command:     "cb:" + plugin + ":" + action,
+		Args:        nil,
+		Payload:     payload,
+		Adapter:     m.adapter,
+		Config:      m.cfgm.Get(),
+		Logger:      m.log,
+		Services:    m.serv,
+		OwnerUserID: m.owners,
+	}
+
+	h := func(ctx context.Context, r *Request) error { return route.Handle(ctx, r, payload) }
+
+	final := Chain(
+		h,
+		MWPanicRecover(m.log),
+		MWRequestLog(m.log),
+		MWTimeout(route.Timeout),
+	)
+
+	select {
+	case m.jobs <- func() {
+		_ = final(root, req)
+		// best-effort to stop "loading" UI
+		_ = m.adapter.AnswerCallback(root, cb.ID, "")
+	}:
+	default:
+		_ = m.adapter.AnswerCallback(root, cb.ID, "busy")
+	}
+}
+
+func isOwner(id int64, owners []int64) bool {
+	for _, o := range owners {
+		if o == id {
+			return true
+		}
+	}
+	return false
+}
