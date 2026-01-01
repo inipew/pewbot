@@ -81,7 +81,7 @@ func (s *Service) Apply(cfg Config) {
 
 	var handlers []slog.Handler
 	if cfg.Console {
-		handlers = append(handlers, slog.NewTextHandler(Stdout(), &slog.HandlerOptions{Level: level}))
+		handlers = append(handlers, NewPrettyHandler(Stdout(), level))
 	}
 
 	// file handler (close old safely)
@@ -110,7 +110,7 @@ func (s *Service) Apply(cfg Config) {
 	}
 
 	if len(handlers) == 0 {
-		handlers = append(handlers, slog.NewTextHandler(Stdout(), &slog.HandlerOptions{Level: level}))
+		handlers = append(handlers, NewPrettyHandler(Stdout(), level))
 	}
 	s.atomicH.Swap(Fanout(handlers...))
 }

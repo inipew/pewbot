@@ -50,3 +50,7 @@ func (n *Service) appendHistory(x kit.Notification) {
 		n.history = n.history[len(n.history)-300:]
 	}
 }
+
+func (n *Service) Stop(ctx context.Context) {
+	// no background workers currently
+}

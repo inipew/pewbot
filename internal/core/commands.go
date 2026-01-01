@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"pewbot/internal/kit"
+	sch "pewbot/internal/services/scheduler"
 )
 
 type Access int
@@ -71,6 +72,11 @@ type SchedulerPort interface {
 
 	AddDaily(name string, atHHMM string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
 	AddWeekly(name string, weekday time.Weekday, atHHMM string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+
+	Remove(name string) bool
+	Enabled() bool
+	Snapshot() sch.Snapshot
+
 }
 
 type BroadcasterPort interface {
@@ -89,7 +95,7 @@ type CommandManager struct {
 	root  *cmdNode
 	alias map[string]*cmdNode // alias -> leaf node
 
-	cbMu     sync.RWMutex
+	cbMu      sync.RWMutex
 	callbacks map[string]map[string]CallbackRoute // plugin -> action -> route
 
 	owners []int64
@@ -126,7 +132,7 @@ func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
 		Access:      AccessEveryone,
 		Handle: func(ctx context.Context, req *Request) error {
 			text := m.helpText(req.Args)
-			_, _ = req.Adapter.SendText(ctx, req.Chat, text, &kit.SendOptions{ParseMode: "Markdown", DisablePreview: true})
+			_, _ = req.Adapter.SendText(ctx, req.Chat, text, &kit.SendOptions{DisablePreview: true})
 			return nil
 		},
 	}
@@ -144,6 +150,13 @@ func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
 		root.add(route, cc)
 
 		leaf := root.find(route)
+		// auto alias for multi-token routes: "a b" -> "a_b" (useful for Telegram menu shortcuts)
+		if len(route) > 1 {
+			auto := strings.Join(route, "_")
+			if _, exists := alias[auto]; !exists {
+				alias[auto] = leaf
+			}
+		}
 		for _, a := range c.Aliases {
 			a = strings.TrimSpace(a)
 			if a == "" || strings.Contains(a, " ") {
@@ -176,30 +189,58 @@ func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
 	m.cbMu.Unlock()
 }
 
-func (m *CommandManager) DispatchLoop(ctx context.Context, updates <-chan kit.Update) {
+func (m *CommandManager) DispatchLoop(ctx context.Context, updates <-chan kit.Update) error {
 	// bounded worker pool (hemat resource & goroutine safe)
 	workers := runtime.NumCPU()
 	if workers < 2 {
 		workers = 2
 	}
+
+	var (
+		wg        sync.WaitGroup
+		closeOnce sync.Once
+	)
+
+	closeJobs := func() {
+		closeOnce.Do(func() {
+			close(m.jobs)
+		})
+	}
+
+	wg.Add(workers)
 	for i := 0; i < workers; i++ {
 		go func() {
+			defer wg.Done()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case job := <-m.jobs:
+				case job, ok := <-m.jobs:
+					if !ok {
+						return
+					}
+					if job == nil {
+						continue
+					}
 					job()
 				}
 			}
 		}()
 	}
 
+	defer func() {
+		closeJobs()
+		wg.Wait()
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case up := <-updates:
+			return nil
+		case up, ok := <-updates:
+			if !ok {
+				return nil
+			}
 			m.routeUpdate(ctx, up)
 		}
 	}
@@ -271,7 +312,7 @@ func (m *CommandManager) routeMessage(root context.Context, up kit.Update) {
 	// If container node without handler: show help for that path
 	if cur.cmd == nil {
 		txt := m.helpText(path)
-		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, txt, &kit.SendOptions{ParseMode: "Markdown", DisablePreview: true})
+		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, txt, &kit.SendOptions{DisablePreview: true})
 		return
 	}
 

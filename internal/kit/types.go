@@ -67,3 +67,15 @@ type Adapter interface {
 	EditText(ctx context.Context, ref MessageRef, text string, opt *SendOptions) error
 	AnswerCallback(ctx context.Context, callbackID string, text string) error
 }
+
+// BotCommand represents a single bot command menu entry.
+type BotCommand struct {
+	Command     string
+	Description string
+}
+
+// CommandMenuUpdater is an optional interface that adapters can implement
+// to update platform-specific bot command menus (e.g. Telegram /menu list).
+type CommandMenuUpdater interface {
+	UpdateMenuCommands(ctx context.Context, cmds []BotCommand) error
+}

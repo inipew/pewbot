@@ -19,12 +19,12 @@ type Plugin interface {
 	Commands() []Command
 }
 
-type CallbackProvider interface {
-	Callbacks() []CallbackRoute
-}
-
 type ConfigurablePlugin interface {
 	OnConfigChange(ctx context.Context, raw json.RawMessage) error
+}
+
+type CallbackProvider interface {
+	Callbacks() []CallbackRoute
 }
 
 type PluginDeps struct {
@@ -43,18 +43,53 @@ type PluginManager struct {
 	deps PluginDeps
 	reg  map[string]Plugin
 	run  map[string]bool
+
+	// Internal, long-lived base context for all plugin contexts.
+	// IMPORTANT: baseCtx is NOT the app ctx passed to StartAll/OnConfigUpdate (which may be call-scoped).
+	// We "bind" app ctx only as a bridge: when appCtx is done, baseCancel is called.
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+	bound      bool
+
+	// per-plugin run context (cancelled on disable/stop)
+	pctx    map[string]context.Context
+	pcancel map[string]context.CancelFunc
+
 	cmdm *CommandManager
 }
 
 func NewPluginManager(log *slog.Logger, cfgm *ConfigManager, deps PluginDeps, cmdm *CommandManager) *PluginManager {
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 	return &PluginManager{
-		log:  log,
-		cfgm: cfgm,
-		deps: deps,
-		reg:  map[string]Plugin{},
-		run:  map[string]bool{},
-		cmdm: cmdm,
+		log:        log,
+		cfgm:       cfgm,
+		deps:       deps,
+		reg:        map[string]Plugin{},
+		run:        map[string]bool{},
+		baseCtx:    baseCtx,
+		baseCancel: baseCancel,
+		pctx:       map[string]context.Context{},
+		pcancel:    map[string]context.CancelFunc{},
+		cmdm:       cmdm,
 	}
+}
+
+// BindContext binds appCtx to baseCtx via cancellation bridge. First non-nil bind wins.
+// This avoids plugins dying because caller passed a short-lived ctx into StartAll/OnConfigUpdate.
+func (pm *PluginManager) BindContext(appCtx context.Context) {
+	pm.mu.Lock()
+	if pm.bound || appCtx == nil {
+		pm.mu.Unlock()
+		return
+	}
+	pm.bound = true
+	baseCancel := pm.baseCancel
+	pm.mu.Unlock()
+
+	go func() {
+		<-appCtx.Done()
+		baseCancel()
+	}()
 }
 
 func (pm *PluginManager) Register(p ...Plugin) {
@@ -63,80 +98,216 @@ func (pm *PluginManager) Register(p ...Plugin) {
 	for _, pl := range p {
 		pm.reg[pl.Name()] = pl
 	}
+	pm.refreshRegistryLocked(pm.cfgm.Get())
 }
 
 func (pm *PluginManager) StartAll(ctx context.Context) error {
-	return pm.reconcile(ctx, pm.cfgm.Get())
+	pm.BindContext(ctx)
+	return pm.reconcile(pm.cfgm.Get())
 }
 
 func (pm *PluginManager) StopAll(ctx context.Context) {
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	for name, p := range pm.reg {
-		if pm.run[name] {
-			_ = p.Stop(ctx)
-			pm.run[name] = false
-		}
+	names := make([]string, 0, len(pm.reg))
+	for name := range pm.reg {
+		names = append(names, name)
 	}
-	pm.refreshRegistryLocked()
+	pm.mu.Unlock()
+
+	for _, name := range names {
+		pm.stopOne(ctx, name)
+	}
+
+	pm.mu.Lock()
+	pm.refreshRegistryLocked(pm.cfgm.Get())
+	pm.mu.Unlock()
 }
 
 func (pm *PluginManager) OnConfigUpdate(ctx context.Context, cfg *Config) {
-	_ = pm.reconcile(ctx, cfg)
+	pm.BindContext(ctx)
+	_ = pm.reconcile(cfg)
 }
 
-func (pm *PluginManager) reconcile(ctx context.Context, cfg *Config) error {
+func (pm *PluginManager) stopOne(stopCtx context.Context, name string) {
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	p := pm.reg[name]
+	running := pm.run[name]
+	cancel := pm.pcancel[name]
+	pctx := pm.pctx[name]
+	pm.mu.Unlock()
 
+	if !running || p == nil {
+		return
+	}
+
+	// cancel plugin context first (stop background loops promptly)
+	if cancel != nil {
+		cancel()
+	}
+
+	// call Stop with stopCtx, but do not allow a misbehaving plugin to block shutdown forever.
+	done := make(chan struct{})
+	go func() {
+		_ = pm.safeCall("plugin.stop."+name, func() error { return p.Stop(stopCtx) })
+		close(done)
+	}()
+	select {
+	case <-done:
+		// ok
+	case <-stopCtx.Done():
+		pm.log.Warn("plugin stop timeout", slog.String("plugin", name), slog.String("err", stopCtx.Err().Error()))
+	}
+
+	pm.mu.Lock()
+	pm.run[name] = false
+	delete(pm.pctx, name)
+	delete(pm.pcancel, name)
+	pm.mu.Unlock()
+
+	pm.log.Info("stopped", slog.String("plugin", name), slog.Bool("ctx_was_set", pctx != nil))
+}
+
+func (pm *PluginManager) reconcile(cfg *Config) error {
+	// snapshot desired actions without holding lock during plugin calls
+	type op struct {
+		name    string
+		p       Plugin
+		raw     PluginConfigRaw
+		enabled bool
+		run     bool
+	}
+	pm.mu.Lock()
+	ops := make([]op, 0, len(pm.reg))
 	for name, p := range pm.reg {
 		raw, ok := cfg.Plugins[name]
 		enabled := ok && raw.Enabled
+		running := pm.run[name]
+		ops = append(ops, op{name: name, p: p, raw: raw, enabled: enabled, run: running})
+	}
+	pm.mu.Unlock()
 
-		if enabled && !pm.run[name] {
-			if err := p.Init(ctx, pm.deps); err != nil {
-				pm.log.Error("plugin init failed", slog.String("plugin", name), slog.String("err", err.Error()))
+	const callTimeout = 10 * time.Second
+
+	for _, o := range ops {
+		switch {
+		case o.enabled && !o.run:
+			// start: create LONG-LIVED plugin ctx from internal base ctx
+			pctx, cancel := context.WithCancel(pm.baseCtx)
+
+			// init (bounded by timeout ctx)
+			{
+				ictx, icancel := context.WithTimeout(pctx, callTimeout)
+				err := pm.safeCall("plugin.init."+o.name, func() error { return o.p.Init(ictx, pm.deps) })
+				icancel()
+				if err != nil {
+					pm.log.Error("plugin init failed", slog.String("plugin", o.name), slog.String("err", err.Error()))
+					cancel()
+					continue
+				}
+			}
+
+			// apply config before Start (bounded by timeout ctx)
+			if cp, ok := o.p.(ConfigurablePlugin); ok {
+				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
+				_ = pm.safeCall("plugin.config."+o.name, func() error { return cp.OnConfigChange(cctx, o.raw.Config) })
+				ccancel()
+			}
+
+			// Start should receive pctx (long-lived). We enforce timeout externally.
+			if err := pm.startWithTimeout(o.name, o.p, pctx, cancel, callTimeout); err != nil {
+				pm.log.Error("plugin start failed", slog.String("plugin", o.name), slog.String("err", err.Error()))
+				cancel()
 				continue
 			}
-			if cp, ok := p.(ConfigurablePlugin); ok {
-				_ = cp.OnConfigChange(ctx, raw.Config)
-			}
-			if err := p.Start(ctx); err != nil {
-				pm.log.Error("plugin start failed", slog.String("plugin", name), slog.String("err", err.Error()))
-				continue
-			}
-			pm.run[name] = true
-			pm.log.Info("plugin started", slog.String("plugin", name))
-		}
 
-		if !enabled && pm.run[name] {
-			_ = p.Stop(ctx)
-			pm.run[name] = false
-			pm.log.Info("plugin stopped", slog.String("plugin", name))
-		}
+			pm.mu.Lock()
+			pm.run[o.name] = true
+			pm.pctx[o.name] = pctx
+			pm.pcancel[o.name] = cancel
+			pm.mu.Unlock()
 
-		if enabled && pm.run[name] {
-			if cp, ok := p.(ConfigurablePlugin); ok {
-				_ = cp.OnConfigChange(ctx, raw.Config)
+			pm.log.Info("started", slog.String("plugin", o.name))
+
+		case !o.enabled && o.run:
+			pm.stopOne(context.Background(), o.name) // caller supplies stop ctx in StopAll; here it may be config toggle - use background
+		case o.enabled && o.run:
+			if cp, ok := o.p.(ConfigurablePlugin); ok {
+				pm.mu.Lock()
+				pctx := pm.pctx[o.name]
+				pm.mu.Unlock()
+				if pctx == nil {
+					pctx = pm.baseCtx
+				}
+				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
+				_ = pm.safeCall("plugin.config."+o.name, func() error { return cp.OnConfigChange(cctx, o.raw.Config) })
+				ccancel()
 			}
 		}
 	}
 
-	pm.refreshRegistryLocked()
+	pm.mu.Lock()
+	pm.refreshRegistryLocked(cfg)
+	pm.mu.Unlock()
 	return nil
 }
 
-func (pm *PluginManager) refreshRegistryLocked() {
-	cfg := pm.cfgm.Get()
-	var cmds []Command
-	var cbs []CallbackRoute
+// startWithTimeout calls Start(pctx) but enforces a deadline. If it times out, plugin ctx is cancelled.
+func (pm *PluginManager) startWithTimeout(name string, p Plugin, pctx context.Context, cancel context.CancelFunc, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- pm.safeCall("plugin.start."+name, func() error { return p.Start(pctx) })
+	}()
 
+	if timeout <= 0 {
+		return <-done
+	}
+
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		// cancel plugin ctx and wait small grace for Start() to return
+		cancel()
+
+		grace := time.NewTimer(2 * time.Second)
+		defer grace.Stop()
+		select {
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("start timeout (%s): %w", timeout, err)
+			}
+			return fmt.Errorf("start timeout (%s)", timeout)
+		case <-grace.C:
+			return fmt.Errorf("start timeout (%s): start did not return after cancel", timeout)
+		}
+	}
+}
+
+func (pm *PluginManager) safeCall(label string, fn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			pm.log.Error("panic in plugin call", slog.String("call", label), slog.Any("panic", r))
+			err = fmt.Errorf("panic in %s: %v", label, r)
+		}
+	}()
+	return fn()
+}
+
+func (pm *PluginManager) refreshRegistryLocked(cfg *Config) {
+	cmds := []Command{}
+	cbs := []CallbackRoute{}
 	for name, p := range pm.reg {
 		if !pm.run[name] {
 			continue
 		}
-		raw := cfg.Plugins[name]
-		pto, has := raw.TimeoutDuration()
+		raw, ok := cfg.Plugins[name]
+		if !ok || !raw.Enabled {
+			continue
+		}
+		pto, has := pluginTimeout(cfg, name)
 
 		for _, c := range p.Commands() {
 			c.PluginName = name
@@ -159,6 +330,21 @@ func (pm *PluginManager) refreshRegistryLocked() {
 	}
 
 	pm.cmdm.SetRegistry(cmds, cbs)
+}
+
+func pluginTimeout(cfg *Config, plugin string) (time.Duration, bool) {
+	raw, ok := cfg.Plugins[plugin]
+	if !ok {
+		return 0, false
+	}
+	if raw.Timeout == "" {
+		return 0, false
+	}
+	d := mustDuration(raw.Timeout, 0)
+	if d <= 0 {
+		return 0, false
+	}
+	return d, true
 }
 
 func (pm *PluginManager) DebugStatus() string {

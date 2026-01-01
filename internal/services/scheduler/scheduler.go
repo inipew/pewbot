@@ -43,6 +43,7 @@ type scheduleDef struct {
 	spec    string // cron spec or @every
 	timeout time.Duration
 	job     func(ctx context.Context) error
+	entryID cron.EntryID
 }
 
 type Service struct {
@@ -63,8 +64,78 @@ type Service struct {
 	tmu    sync.Mutex
 	timers map[string]*time.Timer
 
-	hmu     sync.Mutex
-	history []HistoryItem
+	hmu       sync.Mutex
+	history   []HistoryItem
+	runCtx    context.Context
+	runCancel context.CancelFunc
+	workerWG  sync.WaitGroup
+}
+
+
+type ScheduleInfo struct {
+	ID      string
+	Name    string
+	Spec    string
+	Timeout time.Duration
+	Next    time.Time
+	Prev    time.Time
+}
+
+type Snapshot struct {
+	Enabled   bool
+	Timezone  string
+	Workers   int
+	QueueLen  int
+	Schedules []ScheduleInfo
+	History   []HistoryItem
+}
+
+func (s *Service) Snapshot() Snapshot {
+	s.mu.Lock()
+	enabled := s.cfg.Enabled
+	tz := s.cfg.Timezone
+	workers := s.cfg.Workers
+	ql := 0
+	if s.queue != nil {
+		ql = len(s.queue)
+	}
+	defs := make([]scheduleDef, len(s.defs))
+	copy(defs, s.defs)
+	c := s.c
+	loc := s.loc
+	s.mu.Unlock()
+
+	if loc == nil {
+		loc = time.Local
+	}
+	if tz == "" && loc != nil {
+		tz = loc.String()
+	}
+
+	items := make([]ScheduleInfo, 0, len(defs))
+	for _, d := range defs {
+		it := ScheduleInfo{ID: d.id, Name: d.name, Spec: d.spec, Timeout: d.timeout}
+		if c != nil && d.entryID != 0 {
+			e := c.Entry(d.entryID)
+			it.Next = e.Next
+			it.Prev = e.Prev
+		}
+		items = append(items, it)
+	}
+
+	s.hmu.Lock()
+	hist := make([]HistoryItem, len(s.history))
+	copy(hist, s.history)
+	s.hmu.Unlock()
+
+	return Snapshot{
+		Enabled:   enabled,
+		Timezone: tz,
+		Workers:   workers,
+		QueueLen:  ql,
+		Schedules: items,
+		History:   hist,
+	}
 }
 
 func New(cfg Config, log *slog.Logger) *Service {
@@ -104,6 +175,7 @@ func (s *Service) Start(ctx context.Context) {
 		return
 	}
 	s.stopCh = make(chan struct{})
+	s.runCtx, s.runCancel = context.WithCancel(ctx)
 
 	workers := s.cfg.Workers
 	if workers <= 0 {
@@ -116,29 +188,44 @@ func (s *Service) Start(ctx context.Context) {
 	s.c = cron.New(cron.WithParser(s.parser), cron.WithLocation(loc))
 
 	// re-register existing defs (if any)
-	for _, d := range s.defs {
-		s.addCronLocked(d)
+	for i := range s.defs {
+		s.addCronLocked(&s.defs[i])
 	}
 
+	s.workerWG.Add(workers)
 	for i := 0; i < workers; i++ {
-		go s.worker(ctx, i)
+		idx := i
+		go func() {
+			defer s.workerWG.Done()
+			s.worker(s.runCtx, idx)
+		}()
 	}
 	s.c.Start()
-	s.log.Info("scheduler started", slog.Int("workers", workers), slog.String("tz", loc.String()))
+	s.log.Info("started", slog.Int("workers", workers), slog.String("tz", loc.String()))
 }
 
 func (s *Service) Stop(ctx context.Context) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.stopCh == nil {
+		s.mu.Unlock()
 		return
 	}
 	close(s.stopCh)
 	s.stopCh = nil
+	cancel := s.runCancel
+	s.runCancel = nil
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	s.mu.Lock()
 	if s.c != nil {
 		<-s.c.Stop().Done()
 		s.c = nil
 	}
+	s.mu.Unlock()
 
 	// stop all one-time timers
 	s.tmu.Lock()
@@ -148,7 +235,21 @@ func (s *Service) Stop(ctx context.Context) {
 	s.timers = map[string]*time.Timer{}
 	s.tmu.Unlock()
 
-	s.log.Info("scheduler stopped")
+	done := make(chan struct{})
+	go func() {
+		s.workerWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		// still log; workers will stop soon because runCtx cancelled
+		s.log.Info("stopped")
+		return
+	case <-done:
+		s.log.Info("stopped")
+		return
+	}
 }
 
 func (s *Service) AddCron(name, spec string, timeout time.Duration, job func(ctx context.Context) error) (string, error) {
@@ -160,7 +261,7 @@ func (s *Service) AddCron(name, spec string, timeout time.Duration, job func(ctx
 	id := fmt.Sprintf("cron:%d", time.Now().UnixNano())
 	d := scheduleDef{id: id, name: name, spec: spec, timeout: s.resolveTimeout(timeout), job: job}
 	s.defs = append(s.defs, d)
-	return id, s.addCronLocked(d)
+	return id, s.addCronLocked(&s.defs[len(s.defs)-1])
 }
 
 func (s *Service) AddInterval(name string, every time.Duration, timeout time.Duration, job func(ctx context.Context) error) (string, error) {
@@ -173,7 +274,7 @@ func (s *Service) AddInterval(name string, every time.Duration, timeout time.Dur
 	spec := fmt.Sprintf("@every %s", every.String())
 	d := scheduleDef{id: id, name: name, spec: spec, timeout: s.resolveTimeout(timeout), job: job}
 	s.defs = append(s.defs, d)
-	return id, s.addCronLocked(d)
+	return id, s.addCronLocked(&s.defs[len(s.defs)-1])
 }
 
 // Helper: daily at HH:MM (scheduler timezone)
@@ -197,10 +298,49 @@ func (s *Service) AddWeekly(name string, weekday time.Weekday, atHHMM string, ti
 	return s.AddCron(name, spec, timeout, job)
 }
 
-func (s *Service) addCronLocked(d scheduleDef) error {
-	_, err := s.c.AddFunc(d.spec, func() {
+// Remove unschedules all schedules with the given name. It returns true if something was removed.
+// Safe to call even when scheduler disabled; it will no-op and return false if not started.
+func (s *Service) Remove(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return false
+	}
+
+	removed := false
+	// remove from cron first
+	for i := range s.defs {
+		if s.defs[i].name == name && s.defs[i].entryID != 0 {
+			s.c.Remove(s.defs[i].entryID)
+			removed = true
+			// mark entry removed
+			s.defs[i].entryID = 0
+		}
+	}
+
+	// compact defs (remove entries by name)
+	if removed {
+		n := 0
+		for _, d := range s.defs {
+			if d.name == name {
+				continue
+			}
+			s.defs[n] = d
+			n++
+		}
+		s.defs = s.defs[:n]
+	}
+
+	return removed
+}
+
+func (s *Service) addCronLocked(d *scheduleDef) error {
+	eid, err := s.c.AddFunc(d.spec, func() {
 		s.enqueue(task{id: d.id, name: d.name, timeout: d.timeout, run: d.job, retry: 1})
 	})
+	if err == nil {
+		d.entryID = eid
+	}
 	return err
 }
 
@@ -211,11 +351,11 @@ func (s *Service) restartLocked() {
 	loc := s.loadLocationLocked()
 	s.loc = loc
 	s.c = cron.New(cron.WithParser(s.parser), cron.WithLocation(loc))
-	for _, d := range s.defs {
-		_ = s.addCronLocked(d)
+	for i := range s.defs {
+		_ = s.addCronLocked(&s.defs[i])
 	}
 	s.c.Start()
-	s.log.Info("scheduler restarted", slog.String("tz", loc.String()))
+	s.log.Info("restarted", slog.String("tz", loc.String()))
 }
 
 func (s *Service) loadLocationLocked() *time.Location {

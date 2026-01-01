@@ -4,7 +4,7 @@
     "owner_user_ids": [
       123456789
     ],
-    "group_log": "-123456789",
+    "group_log": "123456789",
     "poll_timeout_sec": 10
   },
   "logging": {
@@ -46,7 +46,7 @@
       "enabled": true
     },
     "systemd": {
-      "enabled": false,
+      "enabled": true,
       "timeout": "15s",
       "config": {
         "prefix": "svc: ",

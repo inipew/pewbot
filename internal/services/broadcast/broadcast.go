@@ -50,8 +50,11 @@ type Service struct {
 	queue   chan job
 	stopCh  chan struct{}
 
-	statusMu sync.RWMutex
-	status   map[string]*JobStatus
+	statusMu  sync.RWMutex
+	status    map[string]*JobStatus
+	runCtx    context.Context
+	runCancel context.CancelFunc
+	workerWG  sync.WaitGroup
 }
 
 func New(cfg Config, adapter kit.Adapter, log *slog.Logger) *Service {
@@ -83,6 +86,9 @@ func (s *Service) Start(ctx context.Context) {
 	if s.stopCh != nil {
 		return
 	}
+	s.stopCh = make(chan struct{})
+	s.runCtx, s.runCancel = context.WithCancel(ctx)
+
 	workers := s.cfg.Workers
 	if workers <= 0 {
 		workers = 4
@@ -93,23 +99,50 @@ func (s *Service) Start(ctx context.Context) {
 	}
 	s.limiter = rate.NewLimiter(rate.Limit(rps), rps)
 
-	s.queue = make(chan job, 64)
-	s.stopCh = make(chan struct{})
+	s.queue = make(chan job, 256)
+
+	s.workerWG.Add(workers)
 	for i := 0; i < workers; i++ {
-		go s.worker(ctx, i)
+		idx := i
+		go func() {
+			defer s.workerWG.Done()
+			s.worker(s.runCtx, idx)
+		}()
 	}
-	s.log.Info("broadcaster started", slog.Int("workers", workers), slog.Int("rps", rps))
+
+	s.log.Info("started", slog.Int("workers", workers), slog.Int("rps", rps))
 }
 
 func (s *Service) Stop(ctx context.Context) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.stopCh == nil {
+		s.mu.Unlock()
 		return
 	}
 	close(s.stopCh)
 	s.stopCh = nil
-	s.log.Info("broadcaster stopped")
+	cancel := s.runCancel
+	s.runCancel = nil
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.workerWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		s.log.Info("stopped")
+		return
+	case <-done:
+		s.log.Info("stopped")
+		return
+	}
 }
 
 func (s *Service) NewJob(name string, targets []kit.ChatTarget, text string, opt *kit.SendOptions) string {

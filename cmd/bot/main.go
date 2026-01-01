@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"pewbot/internal/core"
 	"pewbot/plugins/echo"
@@ -20,8 +21,18 @@ func main() {
 	flag.StringVar(&cfgPath, "config", "./config.json", "path to config json")
 	flag.Parse()
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go func() {
+		<-sigCh
+		cancel()
+		<-sigCh
+		fmt.Println("forced exit")
+		os.Exit(1)
+	}()
+	defer signal.Stop(sigCh)
 
 	app, err := core.NewApp(cfgPath)
 	if err != nil {
@@ -43,5 +54,7 @@ func main() {
 	}
 
 	<-ctx.Done()
-	_ = app.Stop(context.Background())
+	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = app.Stop(stopCtx)
 }

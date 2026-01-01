@@ -3,6 +3,8 @@ package system
 import (
 	"context"
 	"log/slog"
+	"sort"
+	"time"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -67,6 +69,15 @@ func (p *Plugin) Commands() []core.Command {
 				return nil
 			},
 		},
+
+		{
+			Route:       "sched list",
+			Aliases:     []string{"sched_list", "tasks", "task_list"},
+			Description: "list scheduled tasks (owner only)",
+			Usage:       "/sched_list",
+			Access:      core.AccessOwnerOnly,
+			Handle:      p.cmdSchedList,
+		},
 	}
 }
 
@@ -115,4 +126,62 @@ func fmt2(n, div uint64, unit string) string {
 	x := float64(n) / float64(div)
 	ix := int(x * 10) // 1 decimal
 	return itoa(ix/10) + "." + itoa(ix%10) + unit
+}
+
+
+func (p *Plugin) cmdSchedList(ctx context.Context, req *core.Request) error {
+	s := p.deps.Services.Scheduler
+	if s == nil || !s.Enabled() {
+		_, _ = req.Adapter.SendText(ctx, req.Chat, "scheduler is disabled", nil)
+		return nil
+	}
+
+	snap := s.Snapshot()
+	if len(snap.Schedules) == 0 {
+		_, _ = req.Adapter.SendText(ctx, req.Chat, "no scheduled tasks", nil)
+		return nil
+	}
+
+	// sort by name for stable output
+	sort.Slice(snap.Schedules, func(i, j int) bool { return snap.Schedules[i].Name < snap.Schedules[j].Name })
+
+	now := time.Now()
+	lines := make([]string, 0, len(snap.Schedules)+3)
+	lines = append(lines, "⏱ scheduled tasks ("+snap.Timezone+"):")
+	lines = append(lines, "- workers: "+itoa(snap.Workers)+", queue: "+itoa(snap.QueueLen))
+
+	for _, t := range snap.Schedules {
+		next := "-"
+		if !t.Next.IsZero() {
+			next = t.Next.Local().Format("2006-01-02 15:04:05")
+			if t.Next.After(now) {
+				next += " (" + durRel(t.Next.Sub(now)) + ")"
+			}
+		}
+		timeout := "-"
+		if t.Timeout > 0 {
+			timeout = t.Timeout.String()
+		}
+		lines = append(lines, "- "+t.Name+": spec="+t.Spec+", next="+next+", timeout="+timeout)
+	}
+
+	_, _ = req.Adapter.SendText(ctx, req.Chat, strings.Join(lines, "\n"), &kit.SendOptions{DisablePreview: true})
+	return nil
+}
+
+func durRel(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	if d < time.Minute {
+		return itoa(int(d.Seconds())) + "s"
+	}
+	if d < time.Hour {
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		return itoa(m) + "m" + itoa(s) + "s"
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	return itoa(h) + "h" + itoa(m) + "m"
 }

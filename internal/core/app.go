@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"pewbot/internal/adapters/telegram"
 	"pewbot/internal/kit"
@@ -43,10 +44,13 @@ func NewApp(cfgPath string) (*App, error) {
 	}
 
 	// Adapter config mapping
+	bootLog := slog.New(logging.NewPrettyHandler(logging.Stdout(), slog.LevelInfo)).With(slog.String("comp", "telegram"))
+
+	// Adapter config mapping
 	ad, err := telegram.New(telegram.Config{
 		Token:          cfg.Telegram.Token,
 		PollTimeoutSec: cfg.Telegram.PollTimeoutSec,
-	}, slog.New(slog.NewTextHandler(logging.Stdout(), &slog.HandlerOptions{Level: slog.LevelInfo})))
+	}, bootLog)
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +70,7 @@ func NewApp(cfgPath string) (*App, error) {
 			RatePerSec: cfg.Logging.Telegram.RatePerSec,
 		},
 	}, ad)
+	log = log.With(slog.String("comp", "app"))
 
 	// Set Telegram log target (chat + thread)
 	if strings.TrimSpace(cfg.Telegram.GroupLog) != "" {
@@ -81,7 +86,7 @@ func NewApp(cfgPath string) (*App, error) {
 		DefaultTimeoutMS: cfg.Scheduler.DefaultTimeoutMS,
 		HistorySize:      cfg.Scheduler.HistorySize,
 		Timezone:         cfg.Scheduler.Timezone,
-	}, log)
+	}, log.With(slog.String("comp","scheduler")))
 
 	bcastSvc := broadcast.New(broadcast.Config{
 		Enabled:    cfg.Broadcaster.Enabled,
@@ -90,7 +95,7 @@ func NewApp(cfgPath string) (*App, error) {
 		RetryMax:   cfg.Broadcaster.RetryMax,
 	}, ad, log)
 
-	notifSvc := notify.New(ad, log)
+	notifSvc := notify.New(ad, log.With(slog.String("comp","notifier")))
 
 	serv := &Services{
 		Scheduler:   schedSvc,
@@ -98,9 +103,11 @@ func NewApp(cfgPath string) (*App, error) {
 		Notifier:    notifSvc,
 	}
 
-	cmdm := NewCommandManager(log, ad, cfgm, serv, cfg.Telegram.OwnerUserIDs)
+	cmdm := NewCommandManager(log.With(slog.String("comp","commands")),
+		ad, cfgm, serv, cfg.Telegram.OwnerUserIDs)
 
-	pm := NewPluginManager(log, cfgm, PluginDeps{
+	pm := NewPluginManager(log.With(slog.String("comp","plugins")),
+		cfgm, PluginDeps{
 		Logger:      log,
 		Adapter:     ad,
 		Config:      cfgm,
@@ -126,7 +133,7 @@ func NewApp(cfgPath string) (*App, error) {
 func (a *App) Plugins() *PluginManager { return a.pm }
 
 func (a *App) Start(ctx context.Context) error {
-	a.sup = NewSupervisor(ctx)
+	a.sup = NewSupervisor(ctx, WithLogger(a.log), WithCancelOnError(true))
 
 	if err := a.adapter.Start(a.sup.Context(), a.updates); err != nil {
 		return err
@@ -143,13 +150,13 @@ func (a *App) Start(ctx context.Context) error {
 		return err
 	}
 
-	a.sup.Go(func(c context.Context) {
-		a.cmdm.DispatchLoop(c, a.updates)
+	a.sup.Go("commands.dispatch", func(c context.Context) error {
+		return a.cmdm.DispatchLoop(c, a.updates)
 	})
 
 	// hot reload config fan-out
 	sub := a.cfgm.Subscribe(8)
-	a.sup.Go(func(c context.Context) {
+	a.sup.Go0("config.reload", func(c context.Context) {
 		for {
 			select {
 			case <-c.Done():
@@ -201,11 +208,11 @@ func (a *App) Start(ctx context.Context) error {
 		}
 	})
 
-	a.sup.Go(func(c context.Context) {
-		_ = a.cfgm.Watch(c)
+	a.sup.Go("config.watch", func(c context.Context) error {
+		return a.cfgm.Watch(c)
 	})
 
-	a.log.Info("app started")
+	a.log.Info("started")
 	return nil
 }
 
@@ -213,11 +220,68 @@ func (a *App) Stop(ctx context.Context) error {
 	if a.sup == nil {
 		return nil
 	}
-	a.pm.StopAll(ctx)
-	a.sched.Stop(ctx)
-	a.bcast.Stop(ctx)
-	_ = a.adapter.Stop(ctx)
+	a.log.Info("stopping")
 
-	a.sup.Stop()
+	// First, cancel the app run context so background loops start unwinding immediately.
+	a.sup.Cancel()
+
+	// Helper: run a shutdown step with an upper bound so one component can't stall the whole stop.
+	step := func(name string, max time.Duration, fn func(context.Context) error) {
+		start := time.Now()
+		a.log.Debug("stop step begin", slog.String("name", name), slog.Duration("max", max))
+
+		stepCtx := ctx
+		var cancel context.CancelFunc
+		if max > 0 {
+			// respect the caller's deadline; never extend it
+			if dl, ok := ctx.Deadline(); ok {
+				rem := time.Until(dl)
+				if rem <= 0 {
+					max = 0
+				} else if rem < max {
+					max = rem
+				}
+			}
+			if max > 0 {
+				stepCtx, cancel = context.WithTimeout(ctx, max)
+				defer cancel()
+			}
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- fn(stepCtx) }()
+
+		select {
+		case <-ctx.Done():
+			a.log.Warn("stop step cancelled", slog.String("name", name), slog.String("err", ctx.Err().Error()))
+		case err := <-done:
+			if err != nil {
+				a.log.Warn("stop step error", slog.String("name", name), slog.String("err", err.Error()))
+			}
+			took := time.Since(start)
+			if took >= 500*time.Millisecond {
+				a.log.Info("stop step end", slog.String("name", name), slog.Duration("took", took))
+			} else {
+				a.log.Debug("stop step end", slog.String("name", name), slog.Duration("took", took))
+			}
+		case <-stepCtx.Done():
+			// step budget exceeded
+			a.log.Warn("stop step timeout", slog.String("name", name), slog.String("err", stepCtx.Err().Error()))
+		}
+	}
+
+	// Stop plugins first (they may depend on services). StopAll is timeout-safe per-plugin.
+	step("plugins", 4*time.Second, func(c context.Context) error { a.pm.StopAll(c); return nil })
+
+	// Stop services (order: scheduler/broadcaster/notifier/adapter)
+	step("scheduler", 2*time.Second, func(c context.Context) error { a.sched.Stop(c); return nil })
+	step("broadcaster", 2*time.Second, func(c context.Context) error { a.bcast.Stop(c); return nil })
+	step("notifier", 1*time.Second, func(c context.Context) error { a.notif.Stop(c); return nil })
+	step("adapter", 2*time.Second, func(c context.Context) error { return a.adapter.Stop(c) })
+
+	// Finally, wait for supervised goroutines (config watch/reload, command dispatcher, etc.)
+	step("supervisor", 2*time.Second, func(c context.Context) error { return a.sup.Wait(c) })
+
+	a.log.Info("stopped")
 	return nil
 }
