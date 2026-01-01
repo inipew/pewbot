@@ -112,3 +112,10 @@
 {"time":"2026-01-01T14:55:24.9439404+07:00","level":"INFO","msg":"request ok","kind":"message","chat_id":589287392,"thread_id":0,"from_id":589287392,"cmd":"systemd","dur":410688000}
 {"time":"2026-01-01T14:55:38.3459287+07:00","level":"INFO","msg":"scheduler stopped"}
 {"time":"2026-01-01T14:55:38.76874+07:00","level":"INFO","msg":"broadcaster stopped"}
+{"time":"2026-01-01T18:47:27.5086635+07:00","level":"INFO","msg":"started","workers":4,"tz":"Asia/Jakarta"}
+{"time":"2026-01-01T18:47:27.9272428+07:00","level":"INFO","msg":"started","workers":4,"rps":20}
+{"time":"2026-01-01T18:47:28.3620778+07:00","level":"INFO","msg":"started","plugin":"echo"}
+{"time":"2026-01-01T18:47:28.7637481+07:00","level":"INFO","msg":"started","plugin":"system"}
+{"time":"2026-01-01T18:47:29.1726351+07:00","level":"INFO","msg":"started","plugin":"systemd"}
+{"time":"2026-01-01T18:47:30.0753489+07:00","level":"INFO","msg":"started"}
+{"time":"2026-01-01T18:47:32.9603663+07:00","level":"INFO","msg":"stopping"}

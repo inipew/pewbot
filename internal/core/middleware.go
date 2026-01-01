@@ -37,7 +37,11 @@ func MWPanicRecover(log *slog.Logger) Middleware {
 		return func(ctx context.Context, req *Request) (err error) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Error("panic recovered",
+					logger := log
+					if req != nil && req.Logger != nil {
+						logger = req.Logger
+					}
+					logger.Error("panic recovered",
 						slog.Any("panic", r),
 						slog.String("stack", string(debug.Stack())),
 					)
@@ -53,6 +57,10 @@ func MWRequestLog(log *slog.Logger) Middleware {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(ctx context.Context, req *Request) error {
 			start := time.Now()
+			logger := log
+			if req != nil && req.Logger != nil {
+				logger = req.Logger
+			}
 			err := next(ctx, req)
 			d := time.Since(start)
 
@@ -65,9 +73,9 @@ func MWRequestLog(log *slog.Logger) Middleware {
 				slog.Duration("dur", d),
 			}
 			if err != nil {
-				log.Warn("request failed", append(fields, slog.String("err", err.Error()))...)
+				logger.Warn("request failed", append(fields, slog.String("err", err.Error()))...)
 			} else {
-				log.Info("request ok", fields...)
+				logger.Info("request ok", fields...)
 			}
 			return err
 		}

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -86,7 +87,8 @@ func NewApp(cfgPath string) (*App, error) {
 		DefaultTimeoutMS: cfg.Scheduler.DefaultTimeoutMS,
 		HistorySize:      cfg.Scheduler.HistorySize,
 		Timezone:         cfg.Scheduler.Timezone,
-	}, log.With(slog.String("comp","scheduler")))
+		RetryMax:         cfg.Scheduler.RetryMax,
+	}, log.With(slog.String("comp", "scheduler")))
 
 	bcastSvc := broadcast.New(broadcast.Config{
 		Enabled:    cfg.Broadcaster.Enabled,
@@ -95,7 +97,7 @@ func NewApp(cfgPath string) (*App, error) {
 		RetryMax:   cfg.Broadcaster.RetryMax,
 	}, ad, log)
 
-	notifSvc := notify.New(ad, log.With(slog.String("comp","notifier")))
+	notifSvc := notify.New(ad, log.With(slog.String("comp", "notifier")))
 
 	serv := &Services{
 		Scheduler:   schedSvc,
@@ -103,17 +105,17 @@ func NewApp(cfgPath string) (*App, error) {
 		Notifier:    notifSvc,
 	}
 
-	cmdm := NewCommandManager(log.With(slog.String("comp","commands")),
+	cmdm := NewCommandManager(log.With(slog.String("comp", "commands")),
 		ad, cfgm, serv, cfg.Telegram.OwnerUserIDs)
 
-	pm := NewPluginManager(log.With(slog.String("comp","plugins")),
+	pm := NewPluginManager(log.With(slog.String("comp", "plugins")),
 		cfgm, PluginDeps{
-		Logger:      log,
-		Adapter:     ad,
-		Config:      cfgm,
-		Services:    serv,
-		OwnerUserID: cfg.Telegram.OwnerUserIDs,
-	}, cmdm)
+			Logger:      log,
+			Adapter:     ad,
+			Config:      cfgm,
+			Services:    serv,
+			OwnerUserID: cfg.Telegram.OwnerUserIDs,
+		}, cmdm)
 
 	return &App{
 		cfgPath: cfgPath,
@@ -132,8 +134,47 @@ func NewApp(cfgPath string) (*App, error) {
 
 func (a *App) Plugins() *PluginManager { return a.pm }
 
+// Done is closed when the app supervisor context is canceled (fatal error or Stop()).
+func (a *App) Done() <-chan struct{} {
+	if a.sup == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return a.sup.Context().Done()
+}
+
+// Err returns the first fatal error observed by the supervisor (if any).
+func (a *App) Err() error {
+	if a.sup == nil {
+		return nil
+	}
+	return a.sup.Err()
+}
+
 func (a *App) Start(ctx context.Context) error {
 	a.sup = NewSupervisor(ctx, WithLogger(a.log), WithCancelOnError(true))
+	// transactional config reload: validate before commit/publish
+	if a.cfgm != nil {
+		a.cfgm.SetLogger(a.log.With(slog.String("comp", "config")))
+		a.cfgm.SetValidator(func(c context.Context, cfg *Config) error {
+			// global validation
+			if cfg.Scheduler.Workers < 0 {
+				return fmt.Errorf("scheduler.workers must be >= 0")
+			}
+			if cfg.Scheduler.RetryMax < 0 {
+				return fmt.Errorf("scheduler.retry_max must be >= 0")
+			}
+			if cfg.Broadcaster.Workers < 0 {
+				return fmt.Errorf("broadcaster.workers must be >= 0")
+			}
+			// per-plugin validation
+			if a.pm != nil {
+				return a.pm.ValidateConfig(c, cfg)
+			}
+			return nil
+		})
+	}
 
 	if err := a.adapter.Start(a.sup.Context(), a.updates); err != nil {
 		return err
@@ -216,11 +257,11 @@ func (a *App) Start(ctx context.Context) error {
 	return nil
 }
 
-func (a *App) Stop(ctx context.Context) error {
+func (a *App) Stop(ctx context.Context, reason StopReason) error {
 	if a.sup == nil {
 		return nil
 	}
-	a.log.Info("stopping")
+	a.log.Info("stopping", slog.String("reason", string(reason)))
 
 	// First, cancel the app run context so background loops start unwinding immediately.
 	a.sup.Cancel()
@@ -266,12 +307,12 @@ func (a *App) Stop(ctx context.Context) error {
 			}
 		case <-stepCtx.Done():
 			// step budget exceeded
-			a.log.Warn("stop step timeout", slog.String("name", name), slog.String("err", stepCtx.Err().Error()))
+			a.log.Warn("stop step timeout (continuing)", slog.String("name", name), slog.String("err", stepCtx.Err().Error()))
 		}
 	}
 
 	// Stop plugins first (they may depend on services). StopAll is timeout-safe per-plugin.
-	step("plugins", 4*time.Second, func(c context.Context) error { a.pm.StopAll(c); return nil })
+	step("plugins", 4*time.Second, func(c context.Context) error { a.pm.StopAll(c, reason); return nil })
 
 	// Stop services (order: scheduler/broadcaster/notifier/adapter)
 	step("scheduler", 2*time.Second, func(c context.Context) error { a.sched.Stop(c); return nil })

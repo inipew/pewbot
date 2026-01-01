@@ -13,14 +13,18 @@ import (
 var ErrUnsupported = errors.New("systemdmanager: unsupported OS (linux only)")
 
 type ServiceStatus struct {
-	Name        string
-	Active      string
-	SubState    string
-	LoadState   string
-	Description string
-	Memory      uint64
-	Uptime      time.Duration
-	Enabled     bool
+	Name          string
+	Active        string
+	SubState      string
+	LoadState     string
+	Description   string
+	Memory        uint64
+	Uptime        time.Duration
+	Enabled       bool
+	ActiveSince   time.Time // ActiveEnterTimestamp
+	ActiveExit    time.Time // ActiveExitTimestamp
+	InactiveSince time.Time // InactiveEnterTimestamp
+	StateChange   time.Time // StateChangeTimestamp
 }
 
 type OperationResult struct {
@@ -45,8 +49,8 @@ type ServiceEvent struct {
 }
 
 type ServiceWatcher struct {
-	events chan ServiceEvent
-	mu     sync.Mutex
+	events  chan ServiceEvent
+	mu      sync.Mutex
 	stopped bool
 }
 
@@ -109,13 +113,23 @@ func (sm *ServiceManager) StopWithResult(ctx context.Context, serviceName string
 func (sm *ServiceManager) RestartWithResult(ctx context.Context, serviceName string) OperationResult {
 	return OperationResult{ServiceName: serviceName, Success: false, Error: ErrUnsupported, Message: "restart " + serviceName + ": unsupported"}
 }
-func (sm *ServiceManager) StartContext(ctx context.Context, serviceName string) error   { return ErrUnsupported }
-func (sm *ServiceManager) StopContext(ctx context.Context, serviceName string) error    { return ErrUnsupported }
-func (sm *ServiceManager) RestartContext(ctx context.Context, serviceName string) error { return ErrUnsupported }
+func (sm *ServiceManager) StartContext(ctx context.Context, serviceName string) error {
+	return ErrUnsupported
+}
+func (sm *ServiceManager) StopContext(ctx context.Context, serviceName string) error {
+	return ErrUnsupported
+}
+func (sm *ServiceManager) RestartContext(ctx context.Context, serviceName string) error {
+	return ErrUnsupported
+}
 
-func (sm *ServiceManager) EnableContext(ctx context.Context, serviceName string) error  { return ErrUnsupported }
-func (sm *ServiceManager) DisableContext(ctx context.Context, serviceName string) error { return ErrUnsupported }
-func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) bool       { return false }
+func (sm *ServiceManager) EnableContext(ctx context.Context, serviceName string) error {
+	return ErrUnsupported
+}
+func (sm *ServiceManager) DisableContext(ctx context.Context, serviceName string) error {
+	return ErrUnsupported
+}
+func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) bool { return false }
 
 func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
 	return &ServiceStatus{Name: serviceName, Active: "unknown", SubState: "unsupported", LoadState: "unsupported"}, nil
@@ -130,8 +144,12 @@ func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceSta
 	}
 	return out, nil
 }
-func (sm *ServiceManager) GetFailedServices(ctx context.Context) ([]string, error)   { return []string{}, nil }
-func (sm *ServiceManager) GetInactiveServices(ctx context.Context) ([]string, error) { return []string{}, nil }
+func (sm *ServiceManager) GetFailedServices(ctx context.Context) ([]string, error) {
+	return []string{}, nil
+}
+func (sm *ServiceManager) GetInactiveServices(ctx context.Context) ([]string, error) {
+	return []string{}, nil
+}
 
 func (sm *ServiceManager) BatchStart(ctx context.Context, serviceNames []string) BatchResult {
 	return sm.batch(ctx, serviceNames, sm.StartWithResult)
@@ -152,7 +170,7 @@ func (sm *ServiceManager) batch(ctx context.Context, serviceNames []string, op f
 		}
 		res = append(res, r)
 	}
-	return BatchResult{Results: res, SuccessCount: succ, FailureCount: len(res)-succ, Total: len(res)}
+	return BatchResult{Results: res, SuccessCount: succ, FailureCount: len(res) - succ, Total: len(res)}
 }
 
 func (sm *ServiceManager) WatchServices(ctx context.Context, services []string) (*ServiceWatcher, error) {

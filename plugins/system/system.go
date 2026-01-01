@@ -3,11 +3,11 @@ package system
 import (
 	"context"
 	"log/slog"
-	"sort"
-	"time"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
+	"time"
 
 	"pewbot/internal/core"
 	"pewbot/internal/kit"
@@ -18,7 +18,7 @@ type Plugin struct {
 	deps core.PluginDeps
 }
 
-func New() *Plugin { return &Plugin{} }
+func New() *Plugin             { return &Plugin{} }
 func (p *Plugin) Name() string { return "system" }
 
 func (p *Plugin) Init(ctx context.Context, deps core.PluginDeps) error {
@@ -127,7 +127,6 @@ func fmt2(n, div uint64, unit string) string {
 	ix := int(x * 10) // 1 decimal
 	return itoa(ix/10) + "." + itoa(ix%10) + unit
 }
-
 
 func (p *Plugin) cmdSchedList(ctx context.Context, req *core.Request) error {
 	s := p.deps.Services.Scheduler

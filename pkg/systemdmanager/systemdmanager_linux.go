@@ -22,14 +22,18 @@ import (
 
 // ServiceStatus represents the current state of a service.
 type ServiceStatus struct {
-	Name        string
-	Active      string // active, inactive, failed, etc.
-	SubState    string // running, dead, etc.
-	LoadState   string // loaded, not-found, etc.
-	Description string
-	Memory      uint64        // in bytes
-	Uptime      time.Duration // since it became active
-	Enabled     bool          // is enabled on boot
+	Name          string
+	Active        string // active, inactive, failed, etc.
+	SubState      string // running, dead, etc.
+	LoadState     string // loaded, not-found, etc.
+	Description   string
+	Memory        uint64        // in bytes
+	Uptime        time.Duration // since it became active
+	Enabled       bool          // is enabled on boot
+	ActiveSince   time.Time     // ActiveEnterTimestamp
+	ActiveExit    time.Time     // ActiveExitTimestamp
+	InactiveSince time.Time     // InactiveEnterTimestamp
+	StateChange   time.Time     // StateChangeTimestamp
 }
 
 // OperationResult wraps result of a single service operation
@@ -166,6 +170,14 @@ func (sm *ServiceManager) exists(ctx context.Context, serviceName string) bool {
 
 	loadState, _ := getStringProperty(props, "LoadState")
 	return loadState != "not-found"
+}
+
+func parseTimestamp(props map[string]interface{}, key string) time.Time {
+	if ts, ok := props[key].(uint64); ok && ts > 0 {
+		// systemd timestamps are in microseconds since the Unix epoch
+		return time.Unix(int64(ts/1_000_000), 0)
+	}
+	return time.Time{}
 }
 
 func getStringProperty(props map[string]interface{}, key string) (string, bool) {
@@ -415,12 +427,16 @@ func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName stri
 	description, _ := getStringProperty(props, "Description")
 
 	status := &ServiceStatus{
-		Name:        serviceName,
-		Active:      activeState,
-		SubState:    subState,
-		LoadState:   loadState,
-		Description: description,
-		Enabled:     sm.IsEnabled(ctx, serviceName),
+		Name:          serviceName,
+		Active:        activeState,
+		SubState:      subState,
+		LoadState:     loadState,
+		Description:   description,
+		Enabled:       sm.IsEnabled(ctx, serviceName),
+		ActiveSince:   parseTimestamp(props, "ActiveEnterTimestamp"),
+		ActiveExit:    parseTimestamp(props, "ActiveExitTimestamp"),
+		InactiveSince: parseTimestamp(props, "InactiveEnterTimestamp"),
+		StateChange:   parseTimestamp(props, "StateChangeTimestamp"),
 	}
 
 	if mem, ok := props["MemoryCurrent"].(uint64); ok && mem > 0 {

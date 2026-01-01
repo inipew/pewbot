@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,13 +18,23 @@ type ConfigManager struct {
 	mu   sync.RWMutex
 	cfg  *Config
 	subs []chan *Config
+
+	log       *slog.Logger
+	validator func(ctx context.Context, cfg *Config) error
 }
 
 func NewConfigManager(path string) *ConfigManager {
 	return &ConfigManager{path: path}
 }
 
-func (m *ConfigManager) Load() (*Config, error) {
+func (m *ConfigManager) SetLogger(log *slog.Logger) { m.log = log }
+
+// SetValidator installs a validation hook used by Watch() before committing/publishing.
+func (m *ConfigManager) SetValidator(fn func(ctx context.Context, cfg *Config) error) {
+	m.validator = fn
+}
+
+func (m *ConfigManager) Parse() (*Config, error) {
 	b, err := os.ReadFile(m.path)
 	if err != nil {
 		return nil, err
@@ -32,10 +43,22 @@ func (m *ConfigManager) Load() (*Config, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return nil, err
 	}
-	m.mu.Lock()
-	m.cfg = &cfg
-	m.mu.Unlock()
 	return &cfg, nil
+}
+
+func (m *ConfigManager) Commit(cfg *Config) {
+	m.mu.Lock()
+	m.cfg = cfg
+	m.mu.Unlock()
+}
+
+func (m *ConfigManager) Load() (*Config, error) {
+	cfg, err := m.Parse()
+	if err != nil {
+		return nil, err
+	}
+	m.Commit(cfg)
+	return cfg, nil
 }
 
 func (m *ConfigManager) Get() *Config {
@@ -91,10 +114,29 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 			timer.Stop()
 		}
 		timer = time.AfterFunc(250*time.Millisecond, func() {
-			cfg, err := m.Load()
-			if err == nil && cfg != nil {
-				m.publish(cfg)
+			cfg, err := m.Parse()
+			if err != nil || cfg == nil {
+				if m.log != nil {
+					m.log.Warn("config parse failed", slog.String("err", err.Error()))
+				}
+				return
 			}
+
+			// validate before commit/publish (transactional)
+			if m.validator != nil {
+				vctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				err := m.validator(vctx, cfg)
+				cancel()
+				if err != nil {
+					if m.log != nil {
+						m.log.Warn("config rejected", slog.String("err", err.Error()))
+					}
+					return
+				}
+			}
+
+			m.Commit(cfg)
+			m.publish(cfg)
 		})
 	}
 

@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/time/rate"
 
@@ -18,9 +17,9 @@ import (
 func Stdout() io.Writer { return os.Stdout }
 
 type Config struct {
-	Level   string
-	Console bool
-	File    FileConfig
+	Level    string
+	Console  bool
+	File     FileConfig
 	Telegram TelegramConfig
 }
 
@@ -112,6 +111,7 @@ func (s *Service) Apply(cfg Config) {
 	if len(handlers) == 0 {
 		handlers = append(handlers, NewPrettyHandler(Stdout(), level))
 	}
+
 	s.atomicH.Swap(Fanout(handlers...))
 }
 
@@ -133,6 +133,8 @@ func parseLevel(s string, def slog.Level) slog.Level {
 
 // ---- Atomic handler (hot swap without replacing slog.Logger) ----
 
+// AtomicHandler allows swapping the underlying handler at runtime while keeping
+// existing *slog.Logger references valid (including loggers created via .With()).
 type AtomicHandler struct {
 	mu sync.RWMutex
 	h  slog.Handler
@@ -145,16 +147,69 @@ func (a *AtomicHandler) Swap(h slog.Handler) {
 	a.h = h
 	a.mu.Unlock()
 }
-func (a *AtomicHandler) cur() slog.Handler {
+
+func (a *AtomicHandler) current() slog.Handler {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.h
 }
 
-func (a *AtomicHandler) Enabled(ctx context.Context, level slog.Level) bool { return a.cur().Enabled(ctx, level) }
-func (a *AtomicHandler) Handle(ctx context.Context, r slog.Record) error     { return a.cur().Handle(ctx, r) }
-func (a *AtomicHandler) WithAttrs(attrs []slog.Attr) slog.Handler            { return a.cur().WithAttrs(attrs) }
-func (a *AtomicHandler) WithGroup(name string) slog.Handler                 { return a.cur().WithGroup(name) }
+func (a *AtomicHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return a.current().Enabled(ctx, level)
+}
+
+func (a *AtomicHandler) Handle(ctx context.Context, r slog.Record) error {
+	return a.current().Handle(ctx, r)
+}
+
+func (a *AtomicHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &atomicWrappedHandler{base: a, attrs: cloneAttrs(attrs)}
+}
+
+func (a *AtomicHandler) WithGroup(name string) slog.Handler {
+	return &atomicWrappedHandler{base: a, groups: []string{name}}
+}
+
+type atomicWrappedHandler struct {
+	base   *AtomicHandler
+	attrs  []slog.Attr
+	groups []string
+}
+
+func (w *atomicWrappedHandler) current() slog.Handler {
+	h := w.base.current()
+	for _, g := range w.groups {
+		h = h.WithGroup(g)
+	}
+	if len(w.attrs) > 0 {
+		h = h.WithAttrs(w.attrs)
+	}
+	return h
+}
+
+func (w *atomicWrappedHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return w.current().Enabled(ctx, level)
+}
+
+func (w *atomicWrappedHandler) Handle(ctx context.Context, r slog.Record) error {
+	return w.current().Handle(ctx, r)
+}
+
+func (w *atomicWrappedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &atomicWrappedHandler{
+		base:   w.base,
+		attrs:  append(cloneAttrs(w.attrs), attrs...),
+		groups: append([]string(nil), w.groups...),
+	}
+}
+
+func (w *atomicWrappedHandler) WithGroup(name string) slog.Handler {
+	return &atomicWrappedHandler{
+		base:   w.base,
+		attrs:  cloneAttrs(w.attrs),
+		groups: append(append([]string(nil), w.groups...), name),
+	}
+}
 
 // ---- Fanout ----
 
@@ -170,20 +225,38 @@ func (f *fanout) Enabled(ctx context.Context, level slog.Level) bool {
 	}
 	return false
 }
+
 func (f *fanout) Handle(ctx context.Context, r slog.Record) error {
 	for _, h := range f.hs {
 		_ = h.Handle(ctx, r)
 	}
 	return nil
 }
-func (f *fanout) WithAttrs(attrs []slog.Attr) slog.Handler { return f }
-func (f *fanout) WithGroup(name string) slog.Handler       { return f }
+
+func (f *fanout) WithAttrs(attrs []slog.Attr) slog.Handler {
+	hs := make([]slog.Handler, 0, len(f.hs))
+	for _, h := range f.hs {
+		hs = append(hs, h.WithAttrs(attrs))
+	}
+	return &fanout{hs: hs}
+}
+
+func (f *fanout) WithGroup(name string) slog.Handler {
+	hs := make([]slog.Handler, 0, len(f.hs))
+	for _, h := range f.hs {
+		hs = append(hs, h.WithGroup(name))
+	}
+	return &fanout{hs: hs}
+}
 
 // ---- Telegram handler ----
 
 type TelegramHandler struct {
 	svc       *Service
 	baseLevel slog.Level
+
+	attrs  []slog.Attr
+	groups []string
 }
 
 func (t *TelegramHandler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -208,17 +281,72 @@ func (t *TelegramHandler) Handle(ctx context.Context, r slog.Record) error {
 		return nil
 	}
 
-	msg := fmt.Sprintf("[%s] %s", r.Level.String(), r.Message)
+	// Simple structured output, Telegram-friendly.
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s] %s", r.Level.String(), r.Message)
+
+	prefix := strings.Join(t.groups, ".")
+	for _, a := range t.attrs {
+		appendAttrLine(&b, prefix, a)
+	}
 	r.Attrs(func(a slog.Attr) bool {
-		msg += fmt.Sprintf("\n- %s=%v", a.Key, a.Value.Any())
+		appendAttrLine(&b, prefix, a)
 		return true
 	})
 
 	to := kit.ChatTarget{ChatID: chatID, ThreadID: threadID}
-	_, _ = t.svc.sender.SendText(ctx, to, msg, &kit.SendOptions{ParseMode: ""})
-	_ = time.Now()
+	_, _ = t.svc.sender.SendText(ctx, to, b.String(), &kit.SendOptions{ParseMode: ""})
 	return nil
 }
 
-func (t *TelegramHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return t }
-func (t *TelegramHandler) WithGroup(name string) slog.Handler       { return t }
+func (t *TelegramHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &TelegramHandler{
+		svc:       t.svc,
+		baseLevel: t.baseLevel,
+		attrs:     append(cloneAttrs(t.attrs), attrs...),
+		groups:    append([]string(nil), t.groups...),
+	}
+}
+
+func (t *TelegramHandler) WithGroup(name string) slog.Handler {
+	return &TelegramHandler{
+		svc:       t.svc,
+		baseLevel: t.baseLevel,
+		attrs:     cloneAttrs(t.attrs),
+		groups:    append(append([]string(nil), t.groups...), name),
+	}
+}
+
+// ---- helpers ----
+
+func cloneAttrs(in []slog.Attr) []slog.Attr {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]slog.Attr, len(in))
+	copy(out, in)
+	return out
+}
+
+func appendAttrLine(b *strings.Builder, prefix string, a slog.Attr) {
+	// slog.Attr has no Resolve method; only slog.Value does.
+	// Resolve LogValuer values so output is stable across handlers.
+	a.Value = a.Value.Resolve()
+	if a.Equal(slog.Attr{}) {
+		return
+	}
+
+	key := a.Key
+	if prefix != "" {
+		key = prefix + "." + key
+	}
+
+	switch a.Value.Kind() {
+	case slog.KindGroup:
+		for _, ga := range a.Value.Group() {
+			appendAttrLine(b, key, ga)
+		}
+	default:
+		fmt.Fprintf(b, "\n- %s=%v", key, a.Value.Any())
+	}
+}

@@ -25,7 +25,7 @@ type Plugin struct {
 	cfg  Config
 }
 
-func New() *Plugin { return &Plugin{} }
+func New() *Plugin             { return &Plugin{} }
 func (p *Plugin) Name() string { return "speedtest" }
 
 func (p *Plugin) Init(ctx context.Context, deps core.PluginDeps) error {

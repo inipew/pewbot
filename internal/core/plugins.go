@@ -92,6 +92,16 @@ func (pm *PluginManager) BindContext(appCtx context.Context) {
 	}()
 }
 
+func (pm *PluginManager) ctxOr(fallback context.Context, name string) context.Context {
+	pm.mu.Lock()
+	pctx := pm.pctx[name]
+	pm.mu.Unlock()
+	if pctx != nil {
+		return pctx
+	}
+	return fallback
+}
+
 func (pm *PluginManager) Register(p ...Plugin) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -106,7 +116,7 @@ func (pm *PluginManager) StartAll(ctx context.Context) error {
 	return pm.reconcile(pm.cfgm.Get())
 }
 
-func (pm *PluginManager) StopAll(ctx context.Context) {
+func (pm *PluginManager) StopAll(ctx context.Context, reason StopReason) {
 	pm.mu.Lock()
 	names := make([]string, 0, len(pm.reg))
 	for name := range pm.reg {
@@ -115,7 +125,7 @@ func (pm *PluginManager) StopAll(ctx context.Context) {
 	pm.mu.Unlock()
 
 	for _, name := range names {
-		pm.stopOne(ctx, name)
+		pm.stopOne(ctx, name, reason)
 	}
 
 	pm.mu.Lock()
@@ -128,7 +138,7 @@ func (pm *PluginManager) OnConfigUpdate(ctx context.Context, cfg *Config) {
 	_ = pm.reconcile(cfg)
 }
 
-func (pm *PluginManager) stopOne(stopCtx context.Context, name string) {
+func (pm *PluginManager) stopOne(stopCtx context.Context, name string, reason StopReason) {
 	pm.mu.Lock()
 	p := pm.reg[name]
 	running := pm.run[name]
@@ -139,6 +149,9 @@ func (pm *PluginManager) stopOne(stopCtx context.Context, name string) {
 	if !running || p == nil {
 		return
 	}
+
+	start := time.Now()
+	pm.log.Debug("plugin stop begin", slog.String("plugin", name), slog.String("reason", string(reason)))
 
 	// cancel plugin context first (stop background loops promptly)
 	if cancel != nil {
@@ -155,7 +168,7 @@ func (pm *PluginManager) stopOne(stopCtx context.Context, name string) {
 	case <-done:
 		// ok
 	case <-stopCtx.Done():
-		pm.log.Warn("plugin stop timeout", slog.String("plugin", name), slog.String("err", stopCtx.Err().Error()))
+		pm.log.Warn("plugin stop timeout (continuing)", slog.String("plugin", name), slog.String("err", stopCtx.Err().Error()))
 	}
 
 	pm.mu.Lock()
@@ -164,7 +177,12 @@ func (pm *PluginManager) stopOne(stopCtx context.Context, name string) {
 	delete(pm.pcancel, name)
 	pm.mu.Unlock()
 
-	pm.log.Info("stopped", slog.String("plugin", name), slog.Bool("ctx_was_set", pctx != nil))
+	took := time.Since(start)
+	if took >= 500*time.Millisecond {
+		pm.log.Info("plugin stopped", slog.String("plugin", name), slog.String("reason", string(reason)), slog.Duration("took", took), slog.Bool("ctx_was_set", pctx != nil))
+	} else {
+		pm.log.Debug("plugin stopped", slog.String("plugin", name), slog.String("reason", string(reason)), slog.Duration("took", took), slog.Bool("ctx_was_set", pctx != nil))
+	}
 }
 
 func (pm *PluginManager) reconcile(cfg *Config) error {
@@ -207,6 +225,17 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			}
 
 			// apply config before Start (bounded by timeout ctx)
+			if v, ok := o.p.(ConfigValidator); ok {
+				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
+				if err := v.ValidateConfig(cctx, o.raw.Config); err != nil {
+					ccancel()
+					pm.log.Error("plugin config validate failed", slog.String("plugin", o.name), slog.String("err", err.Error()))
+					cancel()
+					continue
+				}
+				ccancel()
+			}
+
 			if cp, ok := o.p.(ConfigurablePlugin); ok {
 				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
 				_ = pm.safeCall("plugin.config."+o.name, func() error { return cp.OnConfigChange(cctx, o.raw.Config) })
@@ -229,7 +258,9 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			pm.log.Info("started", slog.String("plugin", o.name))
 
 		case !o.enabled && o.run:
-			pm.stopOne(context.Background(), o.name) // caller supplies stop ctx in StopAll; here it may be config toggle - use background
+			stopCtx, cancel := context.WithTimeout(pm.baseCtx, callTimeout)
+			pm.stopOne(stopCtx, o.name, StopPluginDisable)
+			cancel()
 		case o.enabled && o.run:
 			if cp, ok := o.p.(ConfigurablePlugin); ok {
 				pm.mu.Lock()
@@ -345,6 +376,51 @@ func pluginTimeout(cfg *Config, plugin string) (time.Duration, bool) {
 		return 0, false
 	}
 	return d, true
+}
+
+// ValidateConfig performs per-plugin config validation BEFORE committing/applying a new config.
+// It does not call Init/Start/Stop and should be fast.
+func (pm *PluginManager) ValidateConfig(ctx context.Context, cfg *Config) error {
+	pm.mu.Lock()
+	ops := make([]struct {
+		name string
+		p    Plugin
+		raw  PluginConfigRaw
+		en   bool
+	}, 0, len(pm.reg))
+	for name, p := range pm.reg {
+		raw, ok := cfg.Plugins[name]
+		enabled := ok && raw.Enabled
+		// validate timeout string if set
+		if ok && raw.Timeout != "" {
+			if _, err := time.ParseDuration(raw.Timeout); err != nil {
+				pm.mu.Unlock()
+				return fmt.Errorf("plugin %s: invalid timeout: %w", name, err)
+			}
+		}
+		ops = append(ops, struct {
+			name string
+			p    Plugin
+			raw  PluginConfigRaw
+			en   bool
+		}{name: name, p: p, raw: raw, en: enabled})
+	}
+	pm.mu.Unlock()
+
+	for _, o := range ops {
+		if !o.en || o.p == nil {
+			continue
+		}
+		if v, ok := o.p.(ConfigValidator); ok {
+			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := v.ValidateConfig(cctx, o.raw.Config)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("plugin %s: config validate: %w", o.name, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (pm *PluginManager) DebugStatus() string {

@@ -21,9 +21,9 @@ type TelegramConfig struct {
 }
 
 type LoggingConfig struct {
-	Level   string           `json:"level"`
-	Console bool             `json:"console"`
-	File    LoggingFile      `json:"file"`
+	Level    string          `json:"level"`
+	Console  bool            `json:"console"`
+	File     LoggingFile     `json:"file"`
 	Telegram LoggingTelegram `json:"telegram"`
 }
 type LoggingFile struct {
@@ -43,6 +43,7 @@ type SchedulerConfig struct {
 	DefaultTimeoutMS int    `json:"default_timeout_ms"`
 	HistorySize      int    `json:"history_size"`
 	Timezone         string `json:"timezone,omitempty"`
+	RetryMax         int    `json:"retry_max,omitempty"`
 }
 
 type BroadcasterConfig struct {

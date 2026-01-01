@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"pewbot/internal/kit"
-	sch "pewbot/internal/services/scheduler"
 )
 
 type Access int
@@ -53,6 +52,12 @@ type Request struct {
 	Args    []string
 	Payload string // callback payload (raw string)
 
+	// Parsed arguments
+	RawArgs   []string
+	Flags     map[string]string
+	BoolFlags map[string]bool
+	ReqID     string
+
 	Adapter     kit.Adapter
 	Config      *Config
 	Logger      *slog.Logger
@@ -67,16 +72,20 @@ type Services struct {
 }
 
 type SchedulerPort interface {
-	AddCron(name, spec string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
-	AddInterval(name string, every time.Duration, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+	Enabled() bool
+	Snapshot() Snapshot
 
-	AddDaily(name string, atHHMM string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+	AddCron(name, spec string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+	AddCronOpt(name, spec string, timeout time.Duration, opt TaskOptions, job func(ctx context.Context) error) (string, error)
+
+	AddInterval(name string, every time.Duration, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+	AddIntervalOpt(name string, every time.Duration, timeout time.Duration, opt TaskOptions, job func(ctx context.Context) error) (string, error)
+
+	AddOnce(name string, at time.Time, timeout time.Duration, job func(ctx context.Context) error) (string, error)
+	AddDaily(name, atHHMM string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
 	AddWeekly(name string, weekday time.Weekday, atHHMM string, timeout time.Duration, job func(ctx context.Context) error) (string, error)
 
 	Remove(name string) bool
-	Enabled() bool
-	Snapshot() sch.Snapshot
-
 }
 
 type BroadcasterPort interface {
@@ -265,7 +274,7 @@ func (m *CommandManager) routeMessage(root context.Context, up kit.Update) {
 		return
 	}
 
-	parts := strings.Fields(text)
+	parts := tokenizeCommandLine(text)
 	if len(parts) == 0 {
 		return
 	}
@@ -287,7 +296,8 @@ func (m *CommandManager) routeMessage(root context.Context, up kit.Update) {
 	// alias as root-level shortcut
 	if leaf, ok := aliasMap[word]; ok && leaf != nil && leaf.cmd != nil {
 		cmd := *leaf.cmd
-		m.enqueueCommand(root, up, cmd, splitRoute(cmd.Route), args)
+		pos, flags, bools := parseFlags(args)
+		m.enqueueCommand(root, up, cmd, splitRoute(cmd.Route), pos, args, flags, bools)
 		return
 	}
 
@@ -300,6 +310,9 @@ func (m *CommandManager) routeMessage(root context.Context, up kit.Update) {
 	path := []string{word}
 	for len(args) > 0 {
 		nxt := args[0]
+		if strings.HasPrefix(nxt, "-") { // flags start, stop subcommand traversal
+			break
+		}
 		child, ok := cur.child(nxt)
 		if !ok {
 			break
@@ -317,10 +330,11 @@ func (m *CommandManager) routeMessage(root context.Context, up kit.Update) {
 	}
 
 	cmd := *cur.cmd
-	m.enqueueCommand(root, up, cmd, path, args)
+	pos, flags, bools := parseFlags(args)
+	m.enqueueCommand(root, up, cmd, path, pos, args, flags, bools)
 }
 
-func (m *CommandManager) enqueueCommand(root context.Context, up kit.Update, cmd Command, path []string, args []string) {
+func (m *CommandManager) enqueueCommand(root context.Context, up kit.Update, cmd Command, path []string, args []string, raw []string, flags map[string]string, bools map[string]bool) {
 	msg := up.Message
 	if msg == nil {
 		return
@@ -331,6 +345,15 @@ func (m *CommandManager) enqueueCommand(root context.Context, up kit.Update, cmd
 		return
 	}
 
+	rid := newReqID()
+	reqLog := m.log.With(
+		slog.String("rid", rid),
+		slog.Int64("chat_id", msg.ChatID),
+		slog.Int("thread_id", msg.ThreadID),
+		slog.Int64("from_id", msg.FromID),
+		slog.String("cmd", cmd.Route),
+	)
+
 	req := &Request{
 		Update:      up,
 		Chat:        kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID},
@@ -338,9 +361,13 @@ func (m *CommandManager) enqueueCommand(root context.Context, up kit.Update, cmd
 		Path:        path,
 		Command:     cmd.Route,
 		Args:        args,
+		RawArgs:     raw,
+		Flags:       flags,
+		BoolFlags:   bools,
+		ReqID:       rid,
 		Adapter:     m.adapter,
 		Config:      m.cfgm.Get(),
-		Logger:      m.log,
+		Logger:      reqLog,
 		Services:    m.serv,
 		OwnerUserID: m.owners,
 	}
@@ -385,6 +412,14 @@ func (m *CommandManager) routeCallback(root context.Context, up kit.Update) {
 	}
 
 	// Owner check: let plugin enforce if needed (or add in route later)
+	rid := newReqID()
+	reqLog := m.log.With(
+		slog.String("rid", rid),
+		slog.Int64("chat_id", cb.ChatID),
+		slog.Int("thread_id", cb.ThreadID),
+		slog.Int64("from_id", cb.FromID),
+		slog.String("cmd", "cb:"+plugin+":"+action),
+	)
 	req := &Request{
 		Update:      up,
 		Chat:        kit.ChatTarget{ChatID: cb.ChatID, ThreadID: cb.ThreadID},
@@ -392,9 +427,13 @@ func (m *CommandManager) routeCallback(root context.Context, up kit.Update) {
 		Command:     "cb:" + plugin + ":" + action,
 		Args:        nil,
 		Payload:     payload,
+		RawArgs:     nil,
+		Flags:       nil,
+		BoolFlags:   nil,
+		ReqID:       rid,
 		Adapter:     m.adapter,
 		Config:      m.cfgm.Get(),
-		Logger:      m.log,
+		Logger:      reqLog,
 		Services:    m.serv,
 		OwnerUserID: m.owners,
 	}

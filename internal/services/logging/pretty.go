@@ -15,7 +15,8 @@ import (
 // It produces compact lines and makes level/component easier to read.
 //
 // Format:
-//   15:04:05.000 INF [component] message key=value ...
+//
+//	15:04:05.000 INF [component] message key=value ...
 type PrettyHandler struct {
 	w       io.Writer
 	mu      *sync.Mutex
@@ -91,7 +92,9 @@ type prettyWithAttrs struct {
 	attrs []slog.Attr
 }
 
-func (p *prettyWithAttrs) Enabled(ctx context.Context, lvl slog.Level) bool { return p.base.Enabled(ctx, lvl) }
+func (p *prettyWithAttrs) Enabled(ctx context.Context, lvl slog.Level) bool {
+	return p.base.Enabled(ctx, lvl)
+}
 func (p *prettyWithAttrs) Handle(ctx context.Context, r slog.Record) error {
 	r2 := r.Clone()
 	for _, a := range p.attrs {
@@ -105,14 +108,18 @@ func (p *prettyWithAttrs) WithAttrs(attrs []slog.Attr) slog.Handler {
 	all = append(all, attrs...)
 	return &prettyWithAttrs{base: p.base, attrs: all}
 }
-func (p *prettyWithAttrs) WithGroup(name string) slog.Handler { return (&prettyWithGroup{base: p.base, group: name}) }
+func (p *prettyWithAttrs) WithGroup(name string) slog.Handler {
+	return (&prettyWithGroup{base: p.base, group: name})
+}
 
 type prettyWithGroup struct {
 	base  *PrettyHandler
 	group string
 }
 
-func (p *prettyWithGroup) Enabled(ctx context.Context, lvl slog.Level) bool { return p.base.Enabled(ctx, lvl) }
+func (p *prettyWithGroup) Enabled(ctx context.Context, lvl slog.Level) bool {
+	return p.base.Enabled(ctx, lvl)
+}
 func (p *prettyWithGroup) Handle(ctx context.Context, r slog.Record) error {
 	if p.group == "" {
 		return p.base.Handle(ctx, r)

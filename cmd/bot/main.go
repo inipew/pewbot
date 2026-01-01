@@ -23,11 +23,27 @@ func main() {
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	reasonCh := make(chan core.StopReason, 1)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	go func() {
-		<-sigCh
+		sig := <-sigCh
+		reason := core.StopUnknown
+		switch sig {
+		case os.Interrupt:
+			reason = core.StopSIGINT
+		case syscall.SIGTERM:
+			reason = core.StopSIGTERM
+		}
+		select { // non-blocking
+		case reasonCh <- reason:
+		default:
+		}
 		cancel()
+
+		// second signal => hard exit
 		<-sigCh
 		fmt.Println("forced exit")
 		os.Exit(1)
@@ -53,8 +69,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	<-ctx.Done()
+	reason := core.StopUnknown
+	select {
+	case <-ctx.Done():
+		select {
+		case reason = <-reasonCh:
+		default:
+		}
+	case <-app.Done():
+		if app.Err() != nil {
+			reason = core.StopFatalError
+		}
+	}
 	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = app.Stop(stopCtx)
+	_ = app.Stop(stopCtx, reason)
 }
