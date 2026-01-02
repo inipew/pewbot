@@ -1,0 +1,159 @@
+package speedtest
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	"pewbot/internal/core"
+)
+
+func (p *Plugin) Commands() []core.Command {
+	return []core.Command{
+		{
+			Route:       "speedtest",
+			Aliases:     []string{"st"},
+			Description: "Run speedtest with detailed results",
+			Usage:       "/speedtest",
+			Access:      core.AccessOwnerOnly,
+			Handle:      p.handleSpeedtest,
+		},
+		{
+			Route:       "speedtest-stats",
+			Aliases:     []string{"sts"},
+			Description: "Show 24-hour speedtest statistics",
+			Usage:       "/speedtest-stats",
+			Access:      core.AccessOwnerOnly,
+			Handle:      p.handleStats,
+		},
+		{
+			Route:       "speedtest-history",
+			Aliases:     []string{"sth"},
+			Description: "Show recent speedtest history",
+			Usage:       "/speedtest-history [count]",
+			Access:      core.AccessOwnerOnly,
+			Handle:      p.handleHistory,
+		},
+		{
+			Route:       "speedtest-clean",
+			Aliases:     []string{"stc"},
+			Description: "Clean old speedtest results",
+			Usage:       "/speedtest-clean [days]",
+			Access:      core.AccessOwnerOnly,
+			Handle:      p.handleClean,
+		},
+	}
+}
+
+// handleSpeedtest handles the speedtest command
+func (p *Plugin) handleSpeedtest(ctx context.Context, req *core.Request) error {
+	p.mu.RLock()
+	prefix := p.cfg.Prefix
+	p.mu.RUnlock()
+
+	// Send loading message
+	_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+"Running speedtest, please wait...", nil)
+
+	// Run speedtest
+	result, msg, err := p.runSpeedtest(ctx)
+	if err != nil {
+		errMsg := fmt.Sprintf("%sError: %v", prefix, err)
+		_, _ = req.Adapter.SendText(ctx, req.Chat, errMsg, nil)
+		return nil
+	}
+
+	// Save to history
+	if err := p.saveResult(result); err != nil {
+		p.Log.Warn("Failed to save result", slog.String("error", err.Error()))
+	}
+
+	// Send result
+	_, _ = req.Adapter.SendText(ctx, req.Chat, msg, nil)
+	return nil
+}
+
+// handleStats handles the speedtest-stats command
+func (p *Plugin) handleStats(ctx context.Context, req *core.Request) error {
+	p.mu.RLock()
+	prefix := p.cfg.Prefix
+	p.mu.RUnlock()
+
+	stats := p.getDailyStats()
+	msg := p.formatStats(stats)
+
+	_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+msg, nil)
+	return nil
+}
+
+// handleHistory handles the speedtest-history command
+func (p *Plugin) handleHistory(ctx context.Context, req *core.Request) error {
+	p.mu.RLock()
+	prefix := p.cfg.Prefix
+	p.mu.RUnlock()
+
+	// Default to 5 recent results
+	count := 5
+	if len(req.Args) > 0 {
+		if n, err := fmt.Sscanf(req.Args[0], "%d", &count); err == nil && n == 1 {
+			if count > 20 {
+				count = 20 // Limit to 20
+			}
+		}
+	}
+
+	results := p.getRecentResults(count)
+	if len(results) == 0 {
+		_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+"No speedtest history available", nil)
+		return nil
+	}
+
+	msg := fmt.Sprintf("📜 Recent %d Speedtest Results\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", len(results))
+	for i, r := range results {
+		msg += fmt.Sprintf(
+			"\n%d. %s\n"+
+				"   ⬇️  %.2f Mbps | ⬆️  %.2f Mbps | 📡 %.2f ms\n"+
+				"   📦 %.2f%% loss | 🖥️  %s",
+			i+1,
+			r.Timestamp.Format("2006-01-02 15:04:05"),
+			r.DownloadMbps,
+			r.UploadMbps,
+			r.PingMs,
+			r.PacketLoss,
+			r.ServerName,
+		)
+	}
+
+	_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+msg, nil)
+	return nil
+}
+
+// handleClean handles the speedtest-clean command
+func (p *Plugin) handleClean(ctx context.Context, req *core.Request) error {
+	p.mu.RLock()
+	prefix := p.cfg.Prefix
+	historyFile := p.cfg.HistoryFile
+	p.mu.RUnlock()
+
+	// Default to 30 days
+	days := 30
+	if len(req.Args) > 0 {
+		if n, err := fmt.Sscanf(req.Args[0], "%d", &days); err == nil && n == 1 {
+			if days < 1 {
+				days = 1
+			}
+		}
+	}
+
+	removed := p.cleanOldResults(days)
+
+	// Save cleaned history
+	if historyFile != "" {
+		if err := p.saveHistory(historyFile); err != nil {
+			p.Log.Warn("Failed to save cleaned history", slog.String("error", err.Error()))
+		}
+	}
+
+	msg := fmt.Sprintf("🧹 Cleaned %d results older than %d days", removed, days)
+	_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+msg, nil)
+	return nil
+}

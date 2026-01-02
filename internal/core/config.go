@@ -211,9 +211,6 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			if m.log != nil {
-				m.log.Debug("fsnotify event", slog.String("file", filepath.Base(ev.Name)), slog.String("op", ev.Op.String()))
-			}
 			// Compare by basename (more robust across absolute/relative paths and OS quirks).
 			if strings.EqualFold(filepath.Base(ev.Name), file) {
 				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove|fsnotify.Chmod) != 0 {
