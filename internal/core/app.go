@@ -198,6 +198,8 @@ func (a *App) Start(ctx context.Context) error {
 	// hot reload config fan-out
 	sub := a.cfgm.Subscribe(8)
 	a.sup.Go0("config.reload", func(c context.Context) {
+		// Track last applied config to generate a safe diff summary for logging.
+		lastApplied := a.cfgm.Get()
 		for {
 			select {
 			case <-c.Done():
@@ -218,6 +220,17 @@ func (a *App) Start(ctx context.Context) error {
 					}
 				}
 			APPLY:
+				sections, attrs, pluginChanged := SummarizeConfigChange(lastApplied, newCfg)
+				if len(sections) > 0 {
+					a.log.Debug("config change summary", append([]any{slog.String("changed", strings.Join(sections, ","))}, attrsToAny(attrs)...)...)
+					if len(pluginChanged) > 0 {
+						a.log.Debug("plugin config changes detected", slog.Any("plugins", pluginChanged))
+					}
+				} else {
+					a.log.Debug("config reload received, but no effective changes detected")
+				}
+				lastApplied = newCfg
+
 				// apply logging updates
 				a.logs.Apply(logging.Config{
 					Level:   newCfg.Logging.Level,
@@ -244,6 +257,10 @@ func (a *App) Start(ctx context.Context) error {
 					a.logs.SetTelegramTarget(0, 0)
 				}
 
+				// Update owner list used for AccessOwnerOnly checks and plugin deps.
+				a.cmdm.SetOwners(newCfg.Telegram.OwnerUserIDs)
+				a.pm.SetOwnerUserIDs(newCfg.Telegram.OwnerUserIDs)
+
 				// apply scheduler/broadcast updates (live)
 				prevSchedEnabled := a.sched.Enabled()
 				prevBcastEnabled := a.bcast.Enabled()
@@ -264,25 +281,34 @@ func (a *App) Start(ctx context.Context) error {
 
 				// enable/disable services on the fly (was previously not handled)
 				if prevSchedEnabled && !newCfg.Scheduler.Enabled {
+					a.log.Info("scheduler disabled via config")
 					stopCtx, cancel := context.WithTimeout(c, 3*time.Second)
 					a.sched.Stop(stopCtx)
 					cancel()
 				} else if !prevSchedEnabled && newCfg.Scheduler.Enabled {
+					a.log.Info("scheduler enabled via config")
 					a.sched.Start(c)
 				}
 
 				if prevBcastEnabled && !newCfg.Broadcaster.Enabled {
+					a.log.Info("broadcaster disabled via config")
 					stopCtx, cancel := context.WithTimeout(c, 3*time.Second)
 					a.bcast.Stop(stopCtx)
 					cancel()
 				} else if !prevBcastEnabled && newCfg.Broadcaster.Enabled {
+					a.log.Info("broadcaster enabled via config")
 					a.bcast.Start(c)
 				}
 
 				// apply plugin enable/disable + per-plugin config
 				a.pm.OnConfigUpdate(c, newCfg)
 
-				a.log.Info("config reloaded")
+				// Keep the final log line concise and human-friendly (details are in debug logs).
+				if len(sections) > 0 {
+					a.log.Info("config reloaded", append([]any{slog.String("changed", strings.Join(sections, ","))}, attrsToAny(attrs)...)...)
+				} else {
+					a.log.Info("config reloaded (no changes)")
+				}
 			}
 		}
 	})
@@ -291,7 +317,7 @@ func (a *App) Start(ctx context.Context) error {
 		return a.cfgm.Watch(c)
 	})
 
-	a.log.Info("started")
+	a.log.Info("app started")
 	return nil
 }
 

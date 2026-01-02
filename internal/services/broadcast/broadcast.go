@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -49,6 +50,8 @@ type Service struct {
 	limiter *rate.Limiter
 	queue   chan job
 	stopCh  chan struct{}
+	// stopDone is non-nil while a Stop() is in progress; it is closed when workers fully exit.
+	stopDone chan struct{}
 
 	statusMu  sync.RWMutex
 	status    map[string]*JobStatus
@@ -58,10 +61,16 @@ type Service struct {
 }
 
 func New(cfg Config, adapter kit.Adapter, log *slog.Logger) *Service {
+	rps := cfg.RatePerSec
+	if rps <= 0 {
+		rps = 10
+	}
 	return &Service{
 		cfg:     cfg,
 		adapter: adapter,
 		log:     log,
+		limiter: rate.NewLimiter(rate.Limit(rps), rps),
+		queue:   make(chan job, 256),
 		status:  map[string]*JobStatus{},
 	}
 }
@@ -88,10 +97,30 @@ func (s *Service) Apply(cfg Config) {
 
 func (s *Service) Start(ctx context.Context) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.stopCh != nil {
-		return
+	cur := s.cfg
+	s.mu.Unlock()
+	s.log.Debug("start requested", slog.Bool("enabled", cur.Enabled), slog.Int("workers", cur.Workers), slog.Int("rps", cur.RatePerSec))
+	// If a Stop() is in progress, wait for it to complete (prevents double worker pools).
+	for {
+		s.mu.Lock()
+		if s.stopCh == nil {
+			break
+		}
+		done := s.stopDone
+		if done == nil {
+			// already running
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+		select {
+		case <-done:
+			// loop
+		case <-ctx.Done():
+			return
+		}
 	}
+	defer s.mu.Unlock()
 	s.stopCh = make(chan struct{})
 	s.runCtx, s.runCancel = context.WithCancel(ctx)
 
@@ -105,57 +134,77 @@ func (s *Service) Start(ctx context.Context) {
 	}
 	s.limiter = rate.NewLimiter(rate.Limit(rps), rps)
 
-	s.queue = make(chan job, 256)
+	// keep queue across restarts (jobs remain pending)
+	queue := s.queue
+	stopCh := s.stopCh
+	runCtx := s.runCtx
 
 	s.workerWG.Add(workers)
 	for i := 0; i < workers; i++ {
 		idx := i
 		go func() {
 			defer s.workerWG.Done()
-			s.worker(s.runCtx, idx)
+			defer func() {
+				if r := recover(); r != nil {
+					s.log.Error("panic in broadcaster worker", slog.Int("worker", idx), slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+				}
+			}()
+			s.log.Debug("worker started", slog.Int("worker", idx))
+			s.worker(runCtx, stopCh, queue, idx)
+			s.log.Debug("worker stopped", slog.Int("worker", idx))
 		}()
 	}
 
-	s.log.Info("started", slog.Int("workers", workers), slog.Int("rps", rps))
+	s.log.Info("service started", slog.Int("workers", workers), slog.Int("rps", rps))
 }
 
 func (s *Service) Stop(ctx context.Context) {
+	start := time.Now()
 	s.mu.Lock()
 	if s.stopCh == nil {
 		s.mu.Unlock()
 		return
 	}
-	// Close stopCh to signal workers to exit, but don't nil it until workers are fully stopped.
-	// This avoids data races where workers are still selecting on s.stopCh.
-	close(s.stopCh)
+	// If a stop is already in progress, just wait for it.
+	if s.stopDone != nil {
+		done := s.stopDone
+		s.mu.Unlock()
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	done := make(chan struct{})
+	s.stopDone = done
+	stopCh := s.stopCh
 	cancel := s.runCancel
 	s.runCancel = nil
 	s.mu.Unlock()
 
+	close(stopCh)
 	if cancel != nil {
 		cancel()
 	}
 
-	done := make(chan struct{})
 	go func() {
 		s.workerWG.Wait()
+		s.mu.Lock()
+		s.stopCh = nil
+		s.runCtx = nil
+		s.stopDone = nil
+		s.mu.Unlock()
 		close(done)
+		s.log.Info("service stopped", slog.Duration("took", time.Since(start)))
 	}()
 
 	select {
-	case <-ctx.Done():
-		s.mu.Lock()
-		s.stopCh = nil
-		s.runCtx = nil
-		s.mu.Unlock()
-		s.log.Info("stopped")
-		return
 	case <-done:
-		s.mu.Lock()
-		s.stopCh = nil
-		s.runCtx = nil
-		s.mu.Unlock()
-		s.log.Info("stopped")
+		return
+	case <-ctx.Done():
+		// stop continues in background
 		return
 	}
 }
@@ -168,9 +217,22 @@ func (s *Service) NewJob(name string, targets []kit.ChatTarget, text string, opt
 	s.statusMu.Unlock()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.queue != nil {
-		s.queue <- job{id: id, name: name, targets: targets, text: text, opt: opt}
+	q := s.queue
+	s.mu.Unlock()
+	if q != nil {
+		select {
+		case q <- job{id: id, name: name, targets: targets, text: text, opt: opt}:
+			s.log.Debug("broadcast job enqueued", slog.String("job", id), slog.String("name", name), slog.Int("total", len(targets)), slog.Int("queue_len", len(q)), slog.Int("queue_cap", cap(q)))
+		default:
+			s.log.Warn("broadcast queue full; dropping job", slog.String("job", id), slog.String("name", name), slog.Int("queue_len", len(q)), slog.Int("queue_cap", cap(q)))
+			s.statusMu.Lock()
+			if st := s.status[id]; st != nil {
+				st.DoneAt = time.Now()
+				st.Running = false
+				st.Failed = st.Total
+			}
+			s.statusMu.Unlock()
+		}
 	}
 	return id
 }
@@ -191,45 +253,102 @@ func (s *Service) Status(jobID string) (any, bool) {
 	return cp, true
 }
 
-func (s *Service) worker(ctx context.Context, idx int) {
+func (s *Service) worker(ctx context.Context, stopCh <-chan struct{}, queue <-chan job, idx int) {
 	for {
+		// fast-exit so stop wins over queued work
 		select {
 		case <-ctx.Done():
 			return
-		case <-s.stopCh:
+		case <-stopCh:
 			return
-		case j := <-s.queue:
+		default:
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-stopCh:
+			return
+		case j := <-queue:
 			s.execJob(ctx, j)
 		}
 	}
 }
 
 func (s *Service) execJob(ctx context.Context, j job) {
+	start := time.Now()
 	s.setRunning(j.id, true)
 	defer s.setRunning(j.id, false)
 
+	s.log.Info("broadcast job started", slog.String("job", j.id), slog.String("name", j.name), slog.Int("total", len(j.targets)))
+
 	for _, t := range j.targets {
-		if err := s.sendOne(ctx, t, j.text, j.opt); err != nil {
+		if err := s.sendOne(ctx, j.id, j.name, t, j.text, j.opt); err != nil {
 			s.markFail(j.id, t)
 		}
 		s.markDone(j.id)
 	}
 	s.finish(j.id)
+
+	// Final summary.
+	stAny, ok := s.Status(j.id)
+	if ok {
+		if st, ok2 := stAny.(JobStatus); ok2 {
+			fields := []any{
+				slog.String("job", j.id),
+				slog.String("name", j.name),
+				slog.Int("total", st.Total),
+				slog.Int("failed", st.Failed),
+				slog.Duration("dur", time.Since(start)),
+			}
+			if st.Failed > 0 {
+				s.log.Warn("broadcast job finished with failures", fields...)
+			} else {
+				s.log.Info("broadcast job finished", fields...)
+			}
+			return
+		}
+	}
+	s.log.Info("broadcast job finished", slog.String("job", j.id), slog.String("name", j.name), slog.Duration("dur", time.Since(start)))
 }
 
-func (s *Service) sendOne(ctx context.Context, t kit.ChatTarget, text string, opt *kit.SendOptions) error {
-	if s.limiter != nil {
-		_ = s.limiter.Wait(ctx)
+func (s *Service) sendOne(ctx context.Context, jobID, jobName string, t kit.ChatTarget, text string, opt *kit.SendOptions) error {
+	// Snapshot mutable dependencies to avoid races with Apply().
+	s.mu.Lock()
+	lim := s.limiter
+	retry := s.cfg.RetryMax
+	adapter := s.adapter
+	s.mu.Unlock()
+
+	if lim != nil {
+		if err := lim.Wait(ctx); err != nil {
+			return err
+		}
 	}
 	var last error
-	retry := s.cfg.RetryMax
 	for i := 0; i <= retry; i++ {
-		_, err := s.adapter.SendText(ctx, t, text, opt)
+		_, err := adapter.SendText(ctx, t, text, opt)
 		if err == nil {
 			return nil
 		}
 		last = err
-		time.Sleep(time.Duration(200+100*i) * time.Millisecond)
+		if i == retry {
+			break
+		}
+		delay := time.Duration(200+100*i) * time.Millisecond
+		s.log.Debug("broadcast send retry scheduled", slog.String("job", jobID), slog.String("name", jobName), slog.Int64("chat_id", t.ChatID), slog.Int("attempt", i+2), slog.Duration("delay", delay), slog.Any("err", err))
+		tmr := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !tmr.Stop() {
+				<-tmr.C
+			}
+			return ctx.Err()
+		case <-tmr.C:
+		}
+	}
+	if last != nil {
+		s.log.Warn("broadcast send failed", slog.String("job", jobID), slog.String("name", jobName), slog.Int64("chat_id", t.ChatID), slog.Int("thread_id", t.ThreadID), slog.Any("err", last))
 	}
 	return last
 }

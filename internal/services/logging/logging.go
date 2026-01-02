@@ -93,10 +93,26 @@ func (s *Service) Apply(cfg Config) {
 		if err == nil {
 			s.file = f
 			handlers = append(handlers, slog.NewJSONHandler(f, &slog.HandlerOptions{Level: level}))
+		} else {
+			// Don't fail the whole logging pipeline because a file can't be opened.
+			if s.logger != nil {
+				s.logger.Warn("log file open failed; continuing without file logging", slog.String("path", cfg.File.Path), slog.Any("err", err))
+			}
 		}
 	}
 
 	// telegram logging handler (optional)
+	if cfg.Telegram.Enabled {
+		if s.sender == nil {
+			if s.logger != nil {
+				s.logger.Warn("telegram logging enabled but telegram adapter is not available")
+			}
+		} else if s.chatID == 0 {
+			if s.logger != nil {
+				s.logger.Warn("telegram logging enabled but no target configured; logs will not be forwarded", slog.String("hint", "set telegram.group_log to a chat ID"))
+			}
+		}
+	}
 	if cfg.Telegram.Enabled && s.sender != nil {
 		s.minLevel = parseLevel(cfg.Telegram.MinLevel, slog.LevelInfo)
 		rps := cfg.Telegram.RatePerSec

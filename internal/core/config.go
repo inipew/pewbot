@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -22,6 +23,11 @@ type ConfigManager struct {
 
 	log       *slog.Logger
 	validator func(ctx context.Context, cfg *Config) error
+
+	// lastHash tracks the last successfully committed config content.
+	// It helps avoid redundant publishes when the editor causes multiple write events
+	// without content changes.
+	lastHash uint64
 }
 
 func NewConfigManager(path string) *ConfigManager {
@@ -50,7 +56,19 @@ func (m *ConfigManager) Parse() (*Config, error) {
 func (m *ConfigManager) Commit(cfg *Config) {
 	m.mu.Lock()
 	m.cfg = cfg
+	m.lastHash = hashConfig(cfg)
 	m.mu.Unlock()
+}
+
+func hashConfig(cfg *Config) uint64 {
+	if cfg == nil {
+		return 0
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return 0
+	}
+	return hashBytes(b)
 }
 
 func (m *ConfigManager) Load() (*Config, error) {
@@ -97,6 +115,13 @@ func (m *ConfigManager) publish(cfg *Config) {
 			case ch <- cfg:
 			default:
 				// still full; give up
+				if m.log != nil {
+					m.log.Debug(
+						"config update dropped (subscriber slow)",
+						slog.Int("queue_len", len(ch)),
+						slog.Int("queue_cap", cap(ch)),
+					)
+				}
 			}
 		}
 	}
@@ -127,6 +152,9 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 		if timer != nil {
 			timer.Stop()
 		}
+		if m.log != nil {
+			m.log.Debug("config change detected; scheduling reload", slog.String("path", m.path))
+		}
 		timer = time.AfterFunc(250*time.Millisecond, func() {
 			cfg, err := m.Parse()
 			if err != nil || cfg == nil {
@@ -137,7 +165,19 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 					} else if cfg == nil {
 						errStr = "config is nil"
 					}
-					m.log.Warn("config parse failed", slog.String("err", errStr))
+					m.log.Warn("config parse failed", slog.String("path", m.path), slog.String("err", errStr))
+				}
+				return
+			}
+
+			// Skip redundant reloads when content is unchanged.
+			h := hashConfig(cfg)
+			m.mu.RLock()
+			unchanged := h != 0 && h == m.lastHash
+			m.mu.RUnlock()
+			if unchanged {
+				if m.log != nil {
+					m.log.Debug("config unchanged; skipping publish", slog.String("path", m.path))
 				}
 				return
 			}
@@ -149,7 +189,7 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 				cancel()
 				if err != nil {
 					if m.log != nil {
-						m.log.Warn("config rejected", slog.String("err", err.Error()))
+						m.log.Warn("config rejected", slog.String("path", m.path), slog.Any("err", err))
 					}
 					return
 				}
@@ -157,6 +197,9 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 
 			m.Commit(cfg)
 			m.publish(cfg)
+			if m.log != nil {
+				m.log.Debug("config published", slog.String("path", m.path), slog.String("hash", fmt.Sprintf("%x", h)))
+			}
 		})
 	}
 
@@ -167,6 +210,9 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 		case ev, ok := <-w.Events:
 			if !ok {
 				return nil
+			}
+			if m.log != nil {
+				m.log.Debug("fsnotify event", slog.String("file", filepath.Base(ev.Name)), slog.String("op", ev.Op.String()))
 			}
 			// Compare by basename (more robust across absolute/relative paths and OS quirks).
 			if strings.EqualFold(filepath.Base(ev.Name), file) {
@@ -179,7 +225,7 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 				return nil
 			}
 			if m.log != nil && err != nil {
-				m.log.Warn("config watch error", slog.String("err", err.Error()), slog.String("dir", dir))
+				m.log.Warn("config watch error", slog.Any("err", err), slog.String("dir", dir))
 			}
 		}
 	}

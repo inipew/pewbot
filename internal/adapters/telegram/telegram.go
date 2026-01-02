@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tele "gopkg.in/telebot.v4"
@@ -28,6 +29,10 @@ type Adapter struct {
 	runWG     sync.WaitGroup
 	runMu     sync.Mutex
 	running   bool
+
+	// droppedUpdates counts updates dropped because the consumer was slower than the Telegram poll loop.
+	// This is logged periodically to avoid per-update log spam.
+	droppedUpdates uint64
 
 	menuMu   sync.Mutex
 	menuHash uint64
@@ -62,8 +67,29 @@ func (a *Adapter) Start(ctx context.Context, out chan<- kit.Update) error {
 	a.out = out
 	rctx, cancel := context.WithCancel(ctx)
 	a.runCancel = cancel
-	a.runWG.Add(1)
+	a.runWG.Add(2)
 	a.runMu.Unlock()
+
+	// Periodic summary for dropped updates (avoid noisy per-update logs).
+	go func() {
+		defer a.runWG.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-rctx.Done():
+				// Final flush.
+				if n := atomic.SwapUint64(&a.droppedUpdates, 0); n > 0 {
+					a.log.Warn("incoming updates dropped (channel full)", slog.Uint64("count", n), slog.Int("chan_cap", cap(out)))
+				}
+				return
+			case <-ticker.C:
+				if n := atomic.SwapUint64(&a.droppedUpdates, 0); n > 0 {
+					a.log.Warn("incoming updates dropped (channel full)", slog.Uint64("count", n), slog.Int("chan_cap", cap(out)))
+				}
+			}
+		}
+	}()
 
 	a.bot.Handle(tele.OnText, func(c tele.Context) error {
 		m := c.Message()
@@ -84,6 +110,7 @@ func (a *Adapter) Start(ctx context.Context, out chan<- kit.Update) error {
 		select {
 		case out <- up:
 		default:
+			atomic.AddUint64(&a.droppedUpdates, 1)
 		}
 		return nil
 	})
@@ -108,6 +135,7 @@ func (a *Adapter) Start(ctx context.Context, out chan<- kit.Update) error {
 		select {
 		case out <- up:
 		default:
+			atomic.AddUint64(&a.droppedUpdates, 1)
 		}
 		return nil
 	})
@@ -135,7 +163,7 @@ func (a *Adapter) Stop(ctx context.Context) error {
 	a.running = false
 	a.runMu.Unlock()
 
-	a.log.Info("stopping")
+	a.log.Info("stopping", slog.Uint64("dropped_updates_pending", atomic.LoadUint64(&a.droppedUpdates)))
 	if !wasRunning {
 		a.log.Debug("telegram stop called but not running")
 		return nil
@@ -172,7 +200,7 @@ func (a *Adapter) Stop(ctx context.Context) error {
 		a.log.Info("polling stopped")
 		return nil
 	case <-ctx.Done():
-		a.log.Warn("telegram stop cancelled", slog.String("err", ctx.Err().Error()))
+		a.log.Warn("telegram stop cancelled", slog.Any("err", ctx.Err()))
 		return ctx.Err()
 	case <-t.C:
 		a.log.Warn("telegram stop grace elapsed; continuing shutdown")

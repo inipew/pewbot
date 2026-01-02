@@ -73,9 +73,14 @@ func MWRequestLog(log *slog.Logger) Middleware {
 				slog.Duration("dur", d),
 			}
 			if err != nil {
-				logger.Warn("request failed", append(fields, slog.String("err", err.Error()))...)
+				logger.Warn("request failed", append(fields, slog.Any("err", err))...)
 			} else {
-				logger.Info("request ok", fields...)
+				// Keep INFO useful: short successful requests go to DEBUG.
+				if d >= 750*time.Millisecond {
+					logger.Info("request ok", fields...)
+				} else {
+					logger.Debug("request ok", fields...)
+				}
 			}
 			return err
 		}

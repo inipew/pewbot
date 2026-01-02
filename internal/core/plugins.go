@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -46,6 +46,8 @@ type PluginManager struct {
 	run  map[string]bool
 	// last config blob hash per running plugin (used to avoid redundant OnConfigChange calls)
 	lastRawHash map[string]uint64
+	// last hash of selected global config values that plugins may implicitly depend on
+	lastGlobalHash uint64
 
 	// Internal, long-lived base context for all plugin contexts.
 	// IMPORTANT: baseCtx is NOT the app ctx passed to StartAll/OnConfigUpdate (which may be call-scoped).
@@ -64,27 +66,38 @@ type PluginManager struct {
 func NewPluginManager(log *slog.Logger, cfgm *ConfigManager, deps PluginDeps, cmdm *CommandManager) *PluginManager {
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 	return &PluginManager{
-		log:        log,
-		cfgm:       cfgm,
-		deps:       deps,
-		reg:        map[string]Plugin{},
-		run:        map[string]bool{},
-		lastRawHash: map[string]uint64{},
-		baseCtx:    baseCtx,
-		baseCancel: baseCancel,
-		pctx:       map[string]context.Context{},
-		pcancel:    map[string]context.CancelFunc{},
-		cmdm:       cmdm,
+		log:            log,
+		cfgm:           cfgm,
+		deps:           deps,
+		reg:            map[string]Plugin{},
+		run:            map[string]bool{},
+		lastRawHash:    map[string]uint64{},
+		lastGlobalHash: 0,
+		baseCtx:        baseCtx,
+		baseCancel:     baseCancel,
+		pctx:           map[string]context.Context{},
+		pcancel:        map[string]context.CancelFunc{},
+		cmdm:           cmdm,
 	}
 }
 
-func rawHash(b json.RawMessage) uint64 {
-	if len(b) == 0 {
+// globalDepsHash captures a small, conservative subset of config that plugins might implicitly depend on.
+// Keeping this small avoids poking unrelated plugins on common service-level config changes.
+func globalDepsHash(cfg *Config) uint64 {
+	if cfg == nil {
 		return 0
 	}
-	h := fnv.New64a()
-	_, _ = h.Write(b)
-	return h.Sum64()
+	type deps struct {
+		Telegram struct {
+			OwnerUserIDs []int64 `json:"owner_user_ids"`
+			GroupLog     string  `json:"group_log"`
+		} `json:"telegram"`
+	}
+	var d deps
+	d.Telegram.OwnerUserIDs = cfg.Telegram.OwnerUserIDs
+	d.Telegram.GroupLog = cfg.Telegram.GroupLog
+	b, _ := json.Marshal(d)
+	return hashBytes(b)
 }
 
 // BindContext binds appCtx to baseCtx via cancellation bridge. First non-nil bind wins.
@@ -151,6 +164,15 @@ func (pm *PluginManager) OnConfigUpdate(ctx context.Context, cfg *Config) {
 	_ = pm.reconcile(cfg)
 }
 
+// SetOwnerUserIDs updates the owner list in PluginDeps so plugins that rely on deps.OwnerUserID
+// can observe changes after a hot-reload.
+func (pm *PluginManager) SetOwnerUserIDs(ids []int64) {
+	cp := append([]int64(nil), ids...)
+	pm.mu.Lock()
+	pm.deps.OwnerUserID = cp
+	pm.mu.Unlock()
+}
+
 func (pm *PluginManager) stopOne(stopCtx context.Context, name string, reason StopReason) {
 	pm.mu.Lock()
 	p := pm.reg[name]
@@ -164,7 +186,7 @@ func (pm *PluginManager) stopOne(stopCtx context.Context, name string, reason St
 	}
 
 	start := time.Now()
-	pm.log.Debug("plugin stop begin", slog.String("plugin", name), slog.String("reason", string(reason)))
+	pm.log.Debug("stopping plugin", slog.String("plugin", name), slog.String("reason", string(reason)))
 
 	// cancel plugin context first (stop background loops promptly)
 	if cancel != nil {
@@ -200,6 +222,12 @@ func (pm *PluginManager) stopOne(stopCtx context.Context, name string, reason St
 }
 
 func (pm *PluginManager) reconcile(cfg *Config) error {
+	// compute global dependency hash once per reconcile (kept intentionally small)
+	newGlobal := globalDepsHash(cfg)
+	pm.mu.Lock()
+	globalChanged := newGlobal != pm.lastGlobalHash
+	pm.mu.Unlock()
+
 	// snapshot desired actions without holding lock during plugin calls
 	type op struct {
 		name    string
@@ -223,6 +251,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 	for _, o := range ops {
 		switch {
 		case o.enabled && !o.run:
+			pm.log.Debug("plugin enable requested", slog.String("plugin", o.name))
 			// start: create LONG-LIVED plugin ctx from internal base ctx
 			pctx, cancel := context.WithCancel(pm.baseCtx)
 
@@ -232,7 +261,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 				err := pm.safeCall("plugin.init."+o.name, func() error { return o.p.Init(ictx, pm.deps) })
 				icancel()
 				if err != nil {
-					pm.log.Error("plugin init failed", slog.String("plugin", o.name), slog.String("err", err.Error()))
+					pm.log.Error("plugin init failed", slog.String("plugin", o.name), slog.Any("err", err))
 					cancel()
 					continue
 				}
@@ -243,7 +272,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
 				if err := v.ValidateConfig(cctx, o.raw.Config); err != nil {
 					ccancel()
-					pm.log.Error("plugin config validate failed", slog.String("plugin", o.name), slog.String("err", err.Error()))
+					pm.log.Error("plugin config validate failed", slog.String("plugin", o.name), slog.Any("err", err))
 					cancel()
 					continue
 				}
@@ -258,7 +287,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 
 			// Start should receive pctx (long-lived). We enforce timeout externally.
 			if err := pm.startWithTimeout(o.name, o.p, pctx, cancel, callTimeout); err != nil {
-				pm.log.Error("plugin start failed", slog.String("plugin", o.name), slog.String("err", err.Error()))
+				pm.log.Error("plugin start failed", slog.String("plugin", o.name), slog.Any("err", err))
 				cancel()
 				continue
 			}
@@ -267,26 +296,31 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			pm.run[o.name] = true
 			pm.pctx[o.name] = pctx
 			pm.pcancel[o.name] = cancel
-			pm.lastRawHash[o.name] = rawHash(o.raw.Config)
+			pm.lastRawHash[o.name] = canonicalHashJSON(o.raw.Config)
 			pm.mu.Unlock()
 
-			pm.log.Info("started", slog.String("plugin", o.name))
+			pm.log.Info("plugin started", slog.String("plugin", o.name))
 
 		case !o.enabled && o.run:
+			pm.log.Debug("plugin disable requested", slog.String("plugin", o.name))
 			stopCtx, cancel := context.WithTimeout(pm.baseCtx, callTimeout)
 			pm.stopOne(stopCtx, o.name, StopPluginDisable)
 			cancel()
 		case o.enabled && o.run:
 			if cp, ok := o.p.(ConfigurablePlugin); ok {
-				newHash := rawHash(o.raw.Config)
+				newHash := canonicalHashJSON(o.raw.Config)
 				pm.mu.Lock()
 				oldHash := pm.lastRawHash[o.name]
 				pctx := pm.pctx[o.name]
 				pm.mu.Unlock()
-				// If the raw config blob didn't change, skip OnConfigChange.
+				// If the raw config blob didn't change and global deps didn't change, skip OnConfigChange.
 				// This prevents thrashing schedules/background loops on unrelated config reloads.
-				if newHash == oldHash {
+				if newHash == oldHash && !globalChanged {
+					pm.log.Debug("plugin config unchanged; skipping", slog.String("plugin", o.name))
 					break
+				}
+				if newHash == oldHash && globalChanged {
+					pm.log.Debug("plugin config unchanged, but global deps changed; reapplying", slog.String("plugin", o.name))
 				}
 				pm.mu.Lock()
 				pm.lastRawHash[o.name] = newHash
@@ -295,11 +329,18 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 					pctx = pm.baseCtx
 				}
 				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
-				_ = pm.safeCall("plugin.config."+o.name, func() error { return cp.OnConfigChange(cctx, o.raw.Config) })
+				err := pm.safeCall("plugin.config."+o.name, func() error { return cp.OnConfigChange(cctx, o.raw.Config) })
+				if err != nil {
+					pm.log.Warn("plugin config apply failed", slog.String("plugin", o.name), slog.Any("err", err))
+				}
 				ccancel()
 			}
 		}
 	}
+
+	pm.mu.Lock()
+	pm.lastGlobalHash = newGlobal
+	pm.mu.Unlock()
 
 	pm.mu.Lock()
 	pm.refreshRegistryLocked(cfg)
@@ -345,7 +386,11 @@ func (pm *PluginManager) startWithTimeout(name string, p Plugin, pctx context.Co
 func (pm *PluginManager) safeCall(label string, fn func() error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			pm.log.Error("panic in plugin call", slog.String("call", label), slog.Any("panic", r))
+			pm.log.Error("panic in plugin call",
+				slog.String("call", label),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
 			err = fmt.Errorf("panic in %s: %v", label, r)
 		}
 	}()

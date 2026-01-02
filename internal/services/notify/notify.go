@@ -38,6 +38,15 @@ func (n *Service) Notify(ctx context.Context, noti kit.Notification) error {
 		prefix = "ℹ️ "
 	}
 	_, err := n.adapter.SendText(ctx, noti.Target, prefix+noti.Text, noti.Options)
+	if err != nil {
+		if n.log != nil {
+			n.log.Warn("notification send failed", slog.String("channel", noti.Channel), slog.Int64("chat_id", noti.Target.ChatID), slog.Int("thread_id", noti.Target.ThreadID), slog.Any("err", err))
+		}
+	} else {
+		if n.log != nil {
+			n.log.Debug("notification sent", slog.String("channel", noti.Channel), slog.Int64("chat_id", noti.Target.ChatID), slog.Int("thread_id", noti.Target.ThreadID), slog.Int("priority", noti.Priority))
+		}
+	}
 	n.appendHistory(noti)
 	return err
 }

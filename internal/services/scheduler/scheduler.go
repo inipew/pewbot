@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,12 +105,15 @@ type Service struct {
 
 	queue  chan task
 	stopCh chan struct{}
+	// stopDone is non-nil while a Stop() is in progress; it is closed when workers fully exit.
+	stopDone chan struct{}
 
-	// one-time timers
+	// one-time timers (timers are runtime; onceAt/onceTimeout are persistent definitions)
 	tmu         sync.Mutex
 	timers      map[string]*time.Timer
 	onceAt      map[string]time.Time
 	onceTimeout map[string]time.Duration
+	onceJob     map[string]func(ctx context.Context) error
 
 	hmu       sync.Mutex
 	history   []HistoryItem
@@ -192,6 +196,7 @@ func New(cfg Config, log *slog.Logger) *Service {
 		timers:      map[string]*time.Timer{},
 		onceAt:      map[string]time.Time{},
 		onceTimeout: map[string]time.Duration{},
+		onceJob:     map[string]func(ctx context.Context) error{},
 	}
 }
 
@@ -224,10 +229,30 @@ func (s *Service) Apply(cfg Config) {
 
 func (s *Service) Start(ctx context.Context) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.stopCh != nil {
-		return
+	cur := s.cfg
+	s.mu.Unlock()
+	s.log.Debug("start requested", slog.Bool("enabled", cur.Enabled), slog.Int("workers", cur.Workers), slog.String("tz", strings.TrimSpace(cur.Timezone)))
+	// If a Stop() is in progress, wait for it to complete (prevents double worker pools).
+	for {
+		s.mu.Lock()
+		if s.stopCh == nil {
+			break
+		}
+		done := s.stopDone
+		// already running (no stop in progress)
+		if done == nil {
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+		select {
+		case <-done:
+			// loop and try again
+		case <-ctx.Done():
+			return
+		}
 	}
+	defer s.mu.Unlock()
 	s.stopCh = make(chan struct{})
 	s.runCtx, s.runCancel = context.WithCancel(ctx)
 
@@ -235,6 +260,7 @@ func (s *Service) Start(ctx context.Context) {
 	if workers <= 0 {
 		workers = 2
 	}
+	// Fresh queue per run to avoid executing "stale" enqueued tasks after a stop/start toggle.
 	s.queue = make(chan task, 256)
 
 	loc := s.loadLocationLocked()
@@ -246,33 +272,64 @@ func (s *Service) Start(ctx context.Context) {
 		s.addCronLocked(&s.defs[i])
 	}
 
+	// Local captures prevent races if fields are swapped/nilled during Stop().
+	runCtx := s.runCtx
+	stopCh := s.stopCh
+	queue := s.queue
+
 	s.workerWG.Add(workers)
 	for i := 0; i < workers; i++ {
 		idx := i
 		go func() {
 			defer s.workerWG.Done()
-			s.worker(s.runCtx, idx)
+			defer func() {
+				if r := recover(); r != nil {
+					s.log.Error("panic in scheduler worker", slog.Int("worker", idx), slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+				}
+			}()
+			s.log.Debug("worker started", slog.Int("worker", idx))
+			s.worker(runCtx, stopCh, queue, idx)
+			s.log.Debug("worker stopped", slog.Int("worker", idx))
 		}()
 	}
 	s.c.Start()
-	s.log.Info("started", slog.Int("workers", workers), slog.String("tz", loc.String()))
+	// Rebuild one-time timers from persistent definitions.
+	s.rebuildOnceTimersLocked()
+	s.log.Info("service started", slog.Int("workers", workers), slog.String("tz", loc.String()), slog.Int("schedules", len(s.defs)))
 }
 
 func (s *Service) Stop(ctx context.Context) {
+	start := time.Now()
+	s.log.Info("stop requested")
+	// If a stop is already in progress, just wait (best-effort).
 	s.mu.Lock()
 	if s.stopCh == nil {
 		s.mu.Unlock()
 		return
 	}
-	// Close stopCh to signal workers to exit, but don't nil it until workers are fully stopped.
-	// This avoids data races where workers are still selecting on s.stopCh.
-	close(s.stopCh)
+	if s.stopDone != nil {
+		done := s.stopDone
+		s.mu.Unlock()
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+	// Initiate stop.
+	done := make(chan struct{})
+	s.stopDone = done
+	stopCh := s.stopCh
 	cancel := s.runCancel
-	s.runCancel = nil
 	c := s.c
+	// prevent new cron enqueues quickly
 	s.c = nil
+	s.runCancel = nil
 	s.mu.Unlock()
 
+	// signal workers to exit promptly
+	close(stopCh)
 	if cancel != nil {
 		cancel()
 	}
@@ -281,37 +338,32 @@ func (s *Service) Stop(ctx context.Context) {
 		<-c.Stop().Done()
 	}
 
-	// stop all one-time timers
+	// stop all runtime one-time timers (keep definitions so they can resume on next Start())
 	s.tmu.Lock()
 	for _, t := range s.timers {
 		_ = t.Stop()
 	}
 	s.timers = map[string]*time.Timer{}
-	s.onceAt = map[string]time.Time{}
-	s.onceTimeout = map[string]time.Duration{}
 	s.tmu.Unlock()
 
-	done := make(chan struct{})
+	// finalize cleanup in background so Stop() can return on timeout safely.
 	go func() {
 		s.workerWG.Wait()
+		s.mu.Lock()
+		s.stopCh = nil
+		s.runCtx = nil
+		s.queue = nil
+		s.stopDone = nil
+		s.mu.Unlock()
 		close(done)
+		s.log.Info("service stopped", slog.Duration("took", time.Since(start)))
 	}()
 
 	select {
-	case <-ctx.Done():
-		// still log; workers will stop soon because runCtx cancelled
-		s.mu.Lock()
-		s.stopCh = nil
-		s.runCtx = nil
-		s.mu.Unlock()
-		s.log.Info("stopped")
-		return
 	case <-done:
-		s.mu.Lock()
-		s.stopCh = nil
-		s.runCtx = nil
-		s.mu.Unlock()
-		s.log.Info("stopped")
+		return
+	case <-ctx.Done():
+		// stop continues in background
 		return
 	}
 }
@@ -323,9 +375,12 @@ func (s *Service) AddCron(name, spec string, timeout time.Duration, job func(ctx
 func (s *Service) AddCronOpt(name, spec string, timeout time.Duration, opt TaskOptions, job func(ctx context.Context) error) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
-		return "", errors.New("scheduler not started")
+	if strings.TrimSpace(name) == "" {
+		return "", errors.New("name required")
 	}
+	// Upsert by name: remove previous schedule with the same name to prevent duplicates
+	// across hot-reloads or repeated registrations.
+	_ = s.removeScheduleLocked(name)
 	id := fmt.Sprintf("cron:%d", time.Now().UnixNano())
 	opt = opt.withDefaults(s.cfg)
 	d := scheduleDef{
@@ -338,7 +393,17 @@ func (s *Service) AddCronOpt(name, spec string, timeout time.Duration, opt TaskO
 		state:   &runState{},
 	}
 	s.defs = append(s.defs, d)
-	return id, s.addCronLocked(&s.defs[len(s.defs)-1])
+	if s.c != nil {
+		err := s.addCronLocked(&s.defs[len(s.defs)-1])
+		if err != nil {
+			s.log.Error("schedule register failed", slog.String("name", name), slog.String("spec", spec), slog.Any("err", err))
+		} else {
+			s.log.Debug("schedule registered", slog.String("name", name), slog.String("id", id), slog.String("spec", spec), slog.Duration("timeout", d.timeout))
+		}
+		return id, err
+	}
+	// Scheduler not started/enabled yet: keep definition and register when Start() runs.
+	return id, nil
 }
 
 func (s *Service) AddInterval(name string, every time.Duration, timeout time.Duration, job func(ctx context.Context) error) (string, error) {
@@ -348,9 +413,10 @@ func (s *Service) AddInterval(name string, every time.Duration, timeout time.Dur
 func (s *Service) AddIntervalOpt(name string, every time.Duration, timeout time.Duration, opt TaskOptions, job func(ctx context.Context) error) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
-		return "", errors.New("scheduler not started")
+	if strings.TrimSpace(name) == "" {
+		return "", errors.New("name required")
 	}
+	_ = s.removeScheduleLocked(name)
 	id := fmt.Sprintf("interval:%d", time.Now().UnixNano())
 	spec := fmt.Sprintf("@every %s", every.String())
 	opt = opt.withDefaults(s.cfg)
@@ -364,7 +430,16 @@ func (s *Service) AddIntervalOpt(name string, every time.Duration, timeout time.
 		state:   &runState{},
 	}
 	s.defs = append(s.defs, d)
-	return id, s.addCronLocked(&s.defs[len(s.defs)-1])
+	if s.c != nil {
+		err := s.addCronLocked(&s.defs[len(s.defs)-1])
+		if err != nil {
+			s.log.Error("schedule register failed", slog.String("name", name), slog.String("spec", spec), slog.Any("err", err))
+		} else {
+			s.log.Debug("schedule registered", slog.String("name", name), slog.String("id", id), slog.String("spec", spec), slog.Duration("timeout", d.timeout))
+		}
+		return id, err
+	}
+	return id, nil
 }
 
 // Helper: daily at HH:MM (scheduler timezone)
@@ -377,21 +452,29 @@ func (s *Service) AddOnce(name string, at time.Time, timeout time.Duration, job 
 		return "", errors.New("at required")
 	}
 
+	// snapshot location + default timeout config under s.mu
 	s.mu.Lock()
-	// upsert: stop existing timer with same name
-	if t, ok := s.timers[name]; ok {
-		t.Stop()
-		delete(s.timers, name)
-		delete(s.onceAt, name)
-		delete(s.onceTimeout, name)
-	}
 	loc := s.loc
+	cfg := s.cfg
+	s.mu.Unlock()
 	if loc == nil {
 		loc = time.Local
 	}
 	runAt := at.In(loc)
+	resolved := timeout
+	if resolved <= 0 && cfg.DefaultTimeoutMS > 0 {
+		resolved = time.Duration(cfg.DefaultTimeoutMS) * time.Millisecond
+	}
+
+	s.tmu.Lock()
+	// upsert: stop existing timer with same name
+	if t, ok := s.timers[name]; ok {
+		_ = t.Stop()
+		delete(s.timers, name)
+	}
 	s.onceAt[name] = runAt
-	s.onceTimeout[name] = s.resolveTimeout(timeout)
+	s.onceTimeout[name] = resolved
+	s.onceJob[name] = job
 
 	// timer callback: enqueue then cleanup
 	delay := time.Until(runAt)
@@ -400,27 +483,28 @@ func (s *Service) AddOnce(name string, at time.Time, timeout time.Duration, job 
 	}
 	timer := time.AfterFunc(delay, func() {
 		// enqueue task
+		s.mu.Lock()
+		cfgNow := s.cfg
+		s.mu.Unlock()
 		s.enqueue(task{
 			id:      fmt.Sprintf("once:%d", time.Now().UnixNano()),
 			name:    name,
-			timeout: s.resolveTimeout(timeout),
+			timeout: resolved,
 			run:     job,
-			opt:     TaskOptions{}.withDefaults(s.cfg),
+			opt:     TaskOptions{}.withDefaults(cfgNow),
 			state:   &runState{},
 		})
 
-		// cleanup
-		s.mu.Lock()
-		if t2, ok := s.timers[name]; ok {
-			_ = t2 // ignore
-		}
+		// cleanup (remove persisted definition)
+		s.tmu.Lock()
 		delete(s.timers, name)
 		delete(s.onceAt, name)
 		delete(s.onceTimeout, name)
-		s.mu.Unlock()
+		delete(s.onceJob, name)
+		s.tmu.Unlock()
 	})
 	s.timers[name] = timer
-	s.mu.Unlock()
+	s.tmu.Unlock()
 
 	return name, nil
 }
@@ -446,38 +530,47 @@ func (s *Service) AddWeekly(name string, weekday time.Weekday, atHHMM string, ti
 }
 
 // Remove unschedules all schedules with the given name. It returns true if something was removed.
-// Safe to call even when scheduler disabled; it will no-op and return false if not started.
+// Safe to call even when scheduler is not started/enabled (it will still remove persisted defs).
 func (s *Service) Remove(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	removed := s.removeScheduleLocked(name)
+	if removed {
+		s.log.Debug("schedule removed", slog.String("name", strings.TrimSpace(name)))
+	}
+	return removed
+}
+
+// removeScheduleLocked removes all defs matching name and unregisters them from cron if running.
+// Call with s.mu held.
+func (s *Service) removeScheduleLocked(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
 		return false
 	}
-
 	removed := false
-	// remove from cron first
-	for i := range s.defs {
-		if s.defs[i].name == name && s.defs[i].entryID != 0 {
-			s.c.Remove(s.defs[i].entryID)
-			removed = true
-			// mark entry removed
-			s.defs[i].entryID = 0
+	if s.c != nil {
+		for i := range s.defs {
+			if s.defs[i].name == name && s.defs[i].entryID != 0 {
+				s.c.Remove(s.defs[i].entryID)
+				s.defs[i].entryID = 0
+				removed = true
+			}
 		}
 	}
-
-	// compact defs (remove entries by name)
-	if removed {
-		n := 0
-		for _, d := range s.defs {
-			if d.name == name {
-				continue
-			}
-			s.defs[n] = d
-			n++
+	// remove from persisted defs regardless of running state
+	n := 0
+	for _, d := range s.defs {
+		if d.name == name {
+			removed = true
+			continue
 		}
+		s.defs[n] = d
+		n++
+	}
+	if n < len(s.defs) {
 		s.defs = s.defs[:n]
 	}
-
 	return removed
 }
 
@@ -488,7 +581,7 @@ func (s *Service) addCronLocked(d *scheduleDef) error {
 			running := d.state.running
 			d.state.mu.Unlock()
 			if running {
-				s.log.Debug("skip schedule (running)", slog.String("task", d.name))
+				s.log.Debug("schedule skipped (previous run still running)", slog.String("task", d.name))
 				return
 			}
 		}
@@ -511,7 +604,59 @@ func (s *Service) restartLocked() {
 		_ = s.addCronLocked(&s.defs[i])
 	}
 	s.c.Start()
-	s.log.Info("restarted", slog.String("tz", loc.String()))
+	s.log.Info("service restarted", slog.String("tz", loc.String()), slog.Int("schedules", len(s.defs)))
+}
+
+// rebuildOnceTimersLocked recreates runtime timers from the persisted once definitions.
+// Call with s.mu held.
+func (s *Service) rebuildOnceTimersLocked() {
+	s.tmu.Lock()
+	defer s.tmu.Unlock()
+	// stop any existing timers (should already be empty after Stop())
+	for _, t := range s.timers {
+		_ = t.Stop()
+	}
+	s.timers = map[string]*time.Timer{}
+
+	// recreate timers from persisted definitions
+	for name, runAt := range s.onceAt {
+		job := s.onceJob[name]
+		timeout := s.onceTimeout[name]
+		if job == nil {
+			delete(s.onceAt, name)
+			delete(s.onceTimeout, name)
+			delete(s.onceJob, name)
+			continue
+		}
+		localName := name
+		localJob := job
+		localTimeout := timeout
+		delay := time.Until(runAt)
+		if delay < 0 {
+			delay = 0
+		}
+		tmr := time.AfterFunc(delay, func() {
+			s.mu.Lock()
+			cfgNow := s.cfg
+			s.mu.Unlock()
+			s.enqueue(task{
+				id:      fmt.Sprintf("once:%d", time.Now().UnixNano()),
+				name:    localName,
+				timeout: localTimeout,
+				run:     localJob,
+				opt:     TaskOptions{}.withDefaults(cfgNow),
+				state:   &runState{},
+			})
+			// cleanup persisted definition
+			s.tmu.Lock()
+			delete(s.timers, localName)
+			delete(s.onceAt, localName)
+			delete(s.onceTimeout, localName)
+			delete(s.onceJob, localName)
+			s.tmu.Unlock()
+		})
+		s.timers[name] = tmr
+	}
 }
 
 func (s *Service) loadLocationLocked() *time.Location {
@@ -521,7 +666,7 @@ func (s *Service) loadLocationLocked() *time.Location {
 	}
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
-		s.log.Warn("invalid timezone, falling back to Local", slog.String("tz", tz), slog.String("err", err.Error()))
+		s.log.Warn("invalid timezone; falling back to Local", slog.String("tz", tz), slog.Any("err", err))
 		return time.Local
 	}
 	return loc
@@ -538,27 +683,44 @@ func (s *Service) resolveTimeout(t time.Duration) time.Duration {
 }
 
 func (s *Service) enqueue(t task) {
+	s.mu.Lock()
+	q := s.queue
+	s.mu.Unlock()
+	if q == nil {
+		s.log.Debug("scheduler not running; dropping task", slog.String("task", t.name))
+		return
+	}
 	select {
-	case s.queue <- t:
+	case q <- t:
+		// ok
 	default:
-		s.log.Warn("scheduler queue full, dropping task", slog.String("task", t.name))
+		s.log.Warn("scheduler queue full; dropping task", slog.String("task", t.name), slog.Int("queue_len", len(q)), slog.Int("queue_cap", cap(q)))
 	}
 }
 
-func (s *Service) worker(ctx context.Context, idx int) {
+func (s *Service) worker(ctx context.Context, stopCh <-chan struct{}, queue <-chan task, idx int) {
 	for {
+		// Fast-exit check so a closed stopCh wins over queued work.
 		select {
 		case <-ctx.Done():
 			return
-		case <-s.stopCh:
+		case <-stopCh:
 			return
-		case t := <-s.queue:
-			s.execOne(ctx, t)
+		default:
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-stopCh:
+			return
+		case t := <-queue:
+			s.execOne(ctx, stopCh, t)
 		}
 	}
 }
 
-func (s *Service) execOne(ctx context.Context, t task) {
+func (s *Service) execOne(ctx context.Context, stopCh <-chan struct{}, t task) {
 	start := time.Now()
 
 	// Mark running for overlap control (shared state between cron invocations).
@@ -585,9 +747,11 @@ func (s *Service) execOne(ctx context.Context, t task) {
 	}
 
 	var err error
+	attempts := 0
 	maxAttempts := 1 + retries
 attemptLoop:
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attempts = attempt
 		// Per-attempt timeout (so a timed-out first attempt doesn't poison retries).
 		runCtx := ctx
 		var cancel func()
@@ -607,7 +771,7 @@ attemptLoop:
 
 		delay := backoffDelay(opt, attempt) // attempt=1 => first retry
 		if delay > 0 {
-			s.log.Debug("task retry", slog.String("task", t.name), slog.Int("attempt", attempt+1), slog.Duration("delay", delay), slog.String("err", err.Error()))
+			s.log.Debug("task retry scheduled", slog.String("task", t.name), slog.Int("attempt", attempt+1), slog.Duration("delay", delay), slog.Any("err", err))
 			tmr := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
@@ -616,7 +780,7 @@ attemptLoop:
 				}
 				err = ctx.Err()
 				break attemptLoop
-			case <-s.stopCh:
+			case <-stopCh:
 				if !tmr.Stop() {
 					<-tmr.C
 				}
@@ -633,11 +797,17 @@ attemptLoop:
 		Started:  start,
 		Duration: time.Since(start),
 	}
+	dur := time.Since(start)
 	if err != nil {
 		item.Error = err.Error()
-		s.log.Warn("task failed", slog.String("task", t.name), slog.String("err", err.Error()))
+		s.log.Warn("task failed", slog.String("task", t.name), slog.Any("err", err), slog.Duration("dur", dur), slog.Int("attempts", attempts))
 	} else {
-		s.log.Info("task ok", slog.String("task", t.name))
+		// Avoid noisy logs for very frequent tasks: only elevate to INFO when it took noticeable time.
+		if dur >= 750*time.Millisecond {
+			s.log.Info("task completed", slog.String("task", t.name), slog.Duration("dur", dur), slog.Int("attempts", attempts))
+		} else {
+			s.log.Debug("task completed", slog.String("task", t.name), slog.Duration("dur", dur), slog.Int("attempts", attempts))
+		}
 	}
 
 	s.hmu.Lock()

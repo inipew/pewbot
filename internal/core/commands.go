@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -118,6 +119,8 @@ type CommandManager struct {
 }
 
 func NewCommandManager(log *slog.Logger, adapter kit.Adapter, cfgm *ConfigManager, serv *Services, owners []int64) *CommandManager {
+	// copy to avoid callers mutating the slice after construction
+	ownCopy := append([]int64(nil), owners...)
 	return &CommandManager{
 		root:      newRoot(),
 		alias:     map[string]*cmdNode{},
@@ -126,9 +129,26 @@ func NewCommandManager(log *slog.Logger, adapter kit.Adapter, cfgm *ConfigManage
 		adapter:   adapter,
 		cfgm:      cfgm,
 		serv:      serv,
-		owners:    owners,
+		owners:    ownCopy,
 		jobs:      make(chan func(), 256),
 	}
+}
+
+// SetOwners updates the owner list used for AccessOwnerOnly checks.
+// Safe to call during hot-reload.
+func (m *CommandManager) SetOwners(owners []int64) {
+	// copy to avoid external mutation
+	ownCopy := append([]int64(nil), owners...)
+	m.mu.Lock()
+	m.owners = ownCopy
+	m.mu.Unlock()
+}
+
+func (m *CommandManager) ownersSnapshot() []int64 {
+	m.mu.RLock()
+	cp := append([]int64(nil), m.owners...)
+	m.mu.RUnlock()
+	return cp
 }
 
 func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
@@ -205,6 +225,10 @@ func (m *CommandManager) DispatchLoop(ctx context.Context, updates <-chan kit.Up
 		workers = 2
 	}
 
+	if m.log != nil {
+		m.log.Info("command dispatcher started", slog.Int("workers", workers), slog.Int("job_queue_cap", cap(m.jobs)))
+	}
+
 	var (
 		wg        sync.WaitGroup
 		closeOnce sync.Once
@@ -218,8 +242,22 @@ func (m *CommandManager) DispatchLoop(ctx context.Context, updates <-chan kit.Up
 
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
+		idx := i
 		go func() {
 			defer wg.Done()
+			if m.log != nil {
+				m.log.Debug("command worker started", slog.Int("worker", idx))
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					if m.log != nil {
+						m.log.Error("panic in command worker", slog.Int("worker", idx), slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+					}
+				}
+				if m.log != nil {
+					m.log.Debug("command worker stopped", slog.Int("worker", idx))
+				}
+			}()
 			for {
 				select {
 				case <-ctx.Done():
@@ -240,14 +278,23 @@ func (m *CommandManager) DispatchLoop(ctx context.Context, updates <-chan kit.Up
 	defer func() {
 		closeJobs()
 		wg.Wait()
+		if m.log != nil {
+			m.log.Info("command dispatcher stopped")
+		}
 	}()
 
 	for {
 		select {
 		case <-ctx.Done():
+			if m.log != nil {
+				m.log.Info("command dispatcher stopped", slog.Any("err", ctx.Err()))
+			}
 			return nil
 		case up, ok := <-updates:
 			if !ok {
+				if m.log != nil {
+					m.log.Info("command dispatcher stopped (updates channel closed)")
+				}
 				return nil
 			}
 			m.routeUpdate(ctx, up)
@@ -340,7 +387,8 @@ func (m *CommandManager) enqueueCommand(root context.Context, up kit.Update, cmd
 		return
 	}
 
-	if cmd.Access == AccessOwnerOnly && !isOwner(msg.FromID, m.owners) {
+	owners := m.ownersSnapshot()
+	if cmd.Access == AccessOwnerOnly && !isOwner(msg.FromID, owners) {
 		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, "unauthorized", nil)
 		return
 	}
@@ -369,7 +417,7 @@ func (m *CommandManager) enqueueCommand(root context.Context, up kit.Update, cmd
 		Config:      m.cfgm.Get(),
 		Logger:      reqLog,
 		Services:    m.serv,
-		OwnerUserID: m.owners,
+		OwnerUserID: owners,
 	}
 
 	final := Chain(
@@ -435,7 +483,7 @@ func (m *CommandManager) routeCallback(root context.Context, up kit.Update) {
 		Config:      m.cfgm.Get(),
 		Logger:      reqLog,
 		Services:    m.serv,
-		OwnerUserID: m.owners,
+		OwnerUserID: m.ownersSnapshot(),
 	}
 
 	h := func(ctx context.Context, r *Request) error { return route.Handle(ctx, r, payload) }
