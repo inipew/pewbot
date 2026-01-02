@@ -202,7 +202,22 @@ func (a *App) Start(ctx context.Context) error {
 			select {
 			case <-c.Done():
 				return
-			case newCfg := <-sub:
+			case newCfg, ok := <-sub:
+				if !ok {
+					return
+				}
+				// Coalesce bursts: keep only the latest config in the channel.
+				for {
+					select {
+					case newer := <-sub:
+						if newer != nil {
+							newCfg = newer
+						}
+					default:
+						goto APPLY
+					}
+				}
+			APPLY:
 				// apply logging updates
 				a.logs.Apply(logging.Config{
 					Level:   newCfg.Logging.Level,
@@ -224,15 +239,21 @@ func (a *App) Start(ctx context.Context) error {
 					if chatID, err := strconv.ParseInt(strings.TrimSpace(newCfg.Telegram.GroupLog), 10, 64); err == nil {
 						a.logs.SetTelegramTarget(chatID, newCfg.Logging.Telegram.ThreadID)
 					}
+				} else {
+					// allow clearing target via config hot-reload
+					a.logs.SetTelegramTarget(0, 0)
 				}
 
 				// apply scheduler/broadcast updates (live)
+				prevSchedEnabled := a.sched.Enabled()
+				prevBcastEnabled := a.bcast.Enabled()
 				a.sched.Apply(scheduler.Config{
 					Enabled:          newCfg.Scheduler.Enabled,
 					Workers:          newCfg.Scheduler.Workers,
 					DefaultTimeoutMS: newCfg.Scheduler.DefaultTimeoutMS,
 					HistorySize:      newCfg.Scheduler.HistorySize,
 					Timezone:         newCfg.Scheduler.Timezone,
+					RetryMax:         newCfg.Scheduler.RetryMax,
 				})
 				a.bcast.Apply(broadcast.Config{
 					Enabled:    newCfg.Broadcaster.Enabled,
@@ -240,6 +261,23 @@ func (a *App) Start(ctx context.Context) error {
 					RatePerSec: newCfg.Broadcaster.RatePerSec,
 					RetryMax:   newCfg.Broadcaster.RetryMax,
 				})
+
+				// enable/disable services on the fly (was previously not handled)
+				if prevSchedEnabled && !newCfg.Scheduler.Enabled {
+					stopCtx, cancel := context.WithTimeout(c, 3*time.Second)
+					a.sched.Stop(stopCtx)
+					cancel()
+				} else if !prevSchedEnabled && newCfg.Scheduler.Enabled {
+					a.sched.Start(c)
+				}
+
+				if prevBcastEnabled && !newCfg.Broadcaster.Enabled {
+					stopCtx, cancel := context.WithTimeout(c, 3*time.Second)
+					a.bcast.Stop(stopCtx)
+					cancel()
+				} else if !prevBcastEnabled && newCfg.Broadcaster.Enabled {
+					a.bcast.Start(c)
+				}
 
 				// apply plugin enable/disable + per-plugin config
 				a.pm.OnConfigUpdate(c, newCfg)

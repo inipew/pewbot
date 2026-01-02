@@ -8,7 +8,7 @@
     "poll_timeout_sec": 10
   },
   "logging": {
-    "level": "INFO",
+    "level": "DEBUG",
     "console": true,
     "file": {
       "enabled": true,
@@ -56,9 +56,14 @@
           "dnscrypt-proxy"
         ],
         "auto_recover": {
-          "enabled": false,
+          "enabled": true,
           "interval": "30s",
-          "min_down": "3s"
+          "min_down": "3s",
+          "backoff_base": "5s",
+          "backoff_max": "5m",
+          "restart_timeout": "15s",
+          "fail_alert_streak": 3,
+          "alert_interval": "10m"
         }
       }
     },

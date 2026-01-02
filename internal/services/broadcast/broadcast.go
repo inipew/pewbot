@@ -66,7 +66,13 @@ func New(cfg Config, adapter kit.Adapter, log *slog.Logger) *Service {
 	}
 }
 
-func (s *Service) Enabled() bool { return s.cfg.Enabled }
+// Enabled reports the current config flag. (Thread-safe; Apply() may run concurrently.)
+func (s *Service) Enabled() bool {
+	s.mu.Lock()
+	en := s.cfg.Enabled
+	s.mu.Unlock()
+	return en
+}
 
 func (s *Service) Apply(cfg Config) {
 	s.mu.Lock()
@@ -119,8 +125,9 @@ func (s *Service) Stop(ctx context.Context) {
 		s.mu.Unlock()
 		return
 	}
+	// Close stopCh to signal workers to exit, but don't nil it until workers are fully stopped.
+	// This avoids data races where workers are still selecting on s.stopCh.
 	close(s.stopCh)
-	s.stopCh = nil
 	cancel := s.runCancel
 	s.runCancel = nil
 	s.mu.Unlock()
@@ -137,9 +144,17 @@ func (s *Service) Stop(ctx context.Context) {
 
 	select {
 	case <-ctx.Done():
+		s.mu.Lock()
+		s.stopCh = nil
+		s.runCtx = nil
+		s.mu.Unlock()
 		s.log.Info("stopped")
 		return
 	case <-done:
+		s.mu.Lock()
+		s.stopCh = nil
+		s.runCtx = nil
+		s.mu.Unlock()
 		s.log.Info("stopped")
 		return
 	}

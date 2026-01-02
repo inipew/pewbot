@@ -76,7 +76,6 @@ type task struct {
 	name    string
 	timeout time.Duration
 	run     func(ctx context.Context) error
-	retry   int
 	opt     TaskOptions
 	state   *runState
 }
@@ -196,7 +195,13 @@ func New(cfg Config, log *slog.Logger) *Service {
 	}
 }
 
-func (s *Service) Enabled() bool { return s.cfg.Enabled }
+// Enabled reports the current config flag. (Thread-safe; Apply() may run concurrently.)
+func (s *Service) Enabled() bool {
+	s.mu.Lock()
+	en := s.cfg.Enabled
+	s.mu.Unlock()
+	return en
+}
 
 func (s *Service) Apply(cfg Config) {
 	s.mu.Lock()
@@ -259,22 +264,22 @@ func (s *Service) Stop(ctx context.Context) {
 		s.mu.Unlock()
 		return
 	}
+	// Close stopCh to signal workers to exit, but don't nil it until workers are fully stopped.
+	// This avoids data races where workers are still selecting on s.stopCh.
 	close(s.stopCh)
-	s.stopCh = nil
 	cancel := s.runCancel
 	s.runCancel = nil
+	c := s.c
+	s.c = nil
 	s.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
 
-	s.mu.Lock()
-	if s.c != nil {
-		<-s.c.Stop().Done()
-		s.c = nil
+	if c != nil {
+		<-c.Stop().Done()
 	}
-	s.mu.Unlock()
 
 	// stop all one-time timers
 	s.tmu.Lock()
@@ -295,9 +300,17 @@ func (s *Service) Stop(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		// still log; workers will stop soon because runCtx cancelled
+		s.mu.Lock()
+		s.stopCh = nil
+		s.runCtx = nil
+		s.mu.Unlock()
 		s.log.Info("stopped")
 		return
 	case <-done:
+		s.mu.Lock()
+		s.stopCh = nil
+		s.runCtx = nil
+		s.mu.Unlock()
 		s.log.Info("stopped")
 		return
 	}
@@ -392,7 +405,6 @@ func (s *Service) AddOnce(name string, at time.Time, timeout time.Duration, job 
 			name:    name,
 			timeout: s.resolveTimeout(timeout),
 			run:     job,
-			retry:   1,
 			opt:     TaskOptions{}.withDefaults(s.cfg),
 			state:   &runState{},
 		})
@@ -480,7 +492,7 @@ func (s *Service) addCronLocked(d *scheduleDef) error {
 				return
 			}
 		}
-		s.enqueue(task{id: d.id, name: d.name, timeout: d.timeout, run: d.job, retry: 1, opt: d.opt, state: d.state})
+		s.enqueue(task{id: d.id, name: d.name, timeout: d.timeout, run: d.job, opt: d.opt, state: d.state})
 	})
 	if err == nil {
 		d.entryID = eid
@@ -548,18 +560,71 @@ func (s *Service) worker(ctx context.Context, idx int) {
 
 func (s *Service) execOne(ctx context.Context, t task) {
 	start := time.Now()
-	runCtx := ctx
-	var cancel func()
-	if t.timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, t.timeout)
-		defer cancel()
+
+	// Mark running for overlap control (shared state between cron invocations).
+	if t.state != nil {
+		t.state.mu.Lock()
+		t.state.running = true
+		t.state.mu.Unlock()
+		defer func() {
+			t.state.mu.Lock()
+			t.state.running = false
+			t.state.mu.Unlock()
+		}()
 	}
 
-	err := t.run(runCtx)
-	if err != nil && t.retry > 0 {
-		// simple retry once
-		time.Sleep(500 * time.Millisecond)
+	// Copy scheduler config to avoid data races with Apply().
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+
+	opt := t.opt.withDefaults(cfg)
+	retries := opt.RetryMax
+	if retries < 0 {
+		retries = 0
+	}
+
+	var err error
+	maxAttempts := 1 + retries
+attemptLoop:
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Per-attempt timeout (so a timed-out first attempt doesn't poison retries).
+		runCtx := ctx
+		var cancel func()
+		if t.timeout > 0 {
+			runCtx, cancel = context.WithTimeout(ctx, t.timeout)
+		}
 		err = t.run(runCtx)
+		if cancel != nil {
+			cancel()
+		}
+		if err == nil {
+			break
+		}
+		if attempt >= maxAttempts {
+			break
+		}
+
+		delay := backoffDelay(opt, attempt) // attempt=1 => first retry
+		if delay > 0 {
+			s.log.Debug("task retry", slog.String("task", t.name), slog.Int("attempt", attempt+1), slog.Duration("delay", delay), slog.String("err", err.Error()))
+			tmr := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !tmr.Stop() {
+					<-tmr.C
+				}
+				err = ctx.Err()
+				break attemptLoop
+			case <-s.stopCh:
+				if !tmr.Stop() {
+					<-tmr.C
+				}
+				err = errors.New("scheduler stopped")
+				break attemptLoop
+			case <-tmr.C:
+			}
+		}
 	}
 
 	item := HistoryItem{

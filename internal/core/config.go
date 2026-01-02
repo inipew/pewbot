@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,10 +81,23 @@ func (m *ConfigManager) publish(cfg *Config) {
 	subs := append([]chan *Config{}, m.subs...)
 	m.mu.RUnlock()
 	for _, ch := range subs {
+		// Always try to deliver the latest config.
+		// If subscriber is slow and buffer is full, drop ONE oldest item then push the newest.
 		select {
 		case ch <- cfg:
+			// delivered
 		default:
-			// drop if slow subscriber (hemat resource)
+			// drop oldest (if any)
+			select {
+			case <-ch:
+			default:
+			}
+			// best-effort deliver latest
+			select {
+			case ch <- cfg:
+			default:
+				// still full; give up
+			}
 		}
 	}
 }
@@ -117,7 +131,13 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 			cfg, err := m.Parse()
 			if err != nil || cfg == nil {
 				if m.log != nil {
-					m.log.Warn("config parse failed", slog.String("err", err.Error()))
+					errStr := "<nil>"
+					if err != nil {
+						errStr = err.Error()
+					} else if cfg == nil {
+						errStr = "config is nil"
+					}
+					m.log.Warn("config parse failed", slog.String("err", errStr))
 				}
 				return
 			}
@@ -144,14 +164,23 @@ func (m *ConfigManager) Watch(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case ev := <-w.Events:
-			if ev.Name == filepath.Join(dir, file) {
-				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+		case ev, ok := <-w.Events:
+			if !ok {
+				return nil
+			}
+			// Compare by basename (more robust across absolute/relative paths and OS quirks).
+			if strings.EqualFold(filepath.Base(ev.Name), file) {
+				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove|fsnotify.Chmod) != 0 {
 					debounce()
 				}
 			}
-		case <-w.Errors:
-			// keep watching
+		case err, ok := <-w.Errors:
+			if !ok {
+				return nil
+			}
+			if m.log != nil && err != nil {
+				m.log.Warn("config watch error", slog.String("err", err.Error()), slog.String("dir", dir))
+			}
 		}
 	}
 }

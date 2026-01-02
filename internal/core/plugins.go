@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -43,6 +44,8 @@ type PluginManager struct {
 	deps PluginDeps
 	reg  map[string]Plugin
 	run  map[string]bool
+	// last config blob hash per running plugin (used to avoid redundant OnConfigChange calls)
+	lastRawHash map[string]uint64
 
 	// Internal, long-lived base context for all plugin contexts.
 	// IMPORTANT: baseCtx is NOT the app ctx passed to StartAll/OnConfigUpdate (which may be call-scoped).
@@ -66,12 +69,22 @@ func NewPluginManager(log *slog.Logger, cfgm *ConfigManager, deps PluginDeps, cm
 		deps:       deps,
 		reg:        map[string]Plugin{},
 		run:        map[string]bool{},
+		lastRawHash: map[string]uint64{},
 		baseCtx:    baseCtx,
 		baseCancel: baseCancel,
 		pctx:       map[string]context.Context{},
 		pcancel:    map[string]context.CancelFunc{},
 		cmdm:       cmdm,
 	}
+}
+
+func rawHash(b json.RawMessage) uint64 {
+	if len(b) == 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return h.Sum64()
 }
 
 // BindContext binds appCtx to baseCtx via cancellation bridge. First non-nil bind wins.
@@ -175,6 +188,7 @@ func (pm *PluginManager) stopOne(stopCtx context.Context, name string, reason St
 	pm.run[name] = false
 	delete(pm.pctx, name)
 	delete(pm.pcancel, name)
+	delete(pm.lastRawHash, name)
 	pm.mu.Unlock()
 
 	took := time.Since(start)
@@ -253,6 +267,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			pm.run[o.name] = true
 			pm.pctx[o.name] = pctx
 			pm.pcancel[o.name] = cancel
+			pm.lastRawHash[o.name] = rawHash(o.raw.Config)
 			pm.mu.Unlock()
 
 			pm.log.Info("started", slog.String("plugin", o.name))
@@ -263,8 +278,18 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			cancel()
 		case o.enabled && o.run:
 			if cp, ok := o.p.(ConfigurablePlugin); ok {
+				newHash := rawHash(o.raw.Config)
 				pm.mu.Lock()
+				oldHash := pm.lastRawHash[o.name]
 				pctx := pm.pctx[o.name]
+				pm.mu.Unlock()
+				// If the raw config blob didn't change, skip OnConfigChange.
+				// This prevents thrashing schedules/background loops on unrelated config reloads.
+				if newHash == oldHash {
+					break
+				}
+				pm.mu.Lock()
+				pm.lastRawHash[o.name] = newHash
 				pm.mu.Unlock()
 				if pctx == nil {
 					pctx = pm.baseCtx

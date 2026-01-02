@@ -97,10 +97,12 @@ func (a *Adapter) Start(ctx context.Context, out chan<- kit.Update) error {
 		up := kit.Update{
 			Kind: kit.UpdateCallback,
 			Callback: &kit.Callback{
-				ChatID:   m.Chat.ID,
-				ThreadID: threadIDFromMsg(m),
-				FromID:   cb.Sender.ID,
-				Data:     cb.Data,
+				ID:        cb.ID,
+				ChatID:    m.Chat.ID,
+				ThreadID:  threadIDFromMsg(m),
+				FromID:    cb.Sender.ID,
+				MessageID: m.ID,
+				Data:      cb.Data,
 			},
 		}
 		select {
