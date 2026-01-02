@@ -17,21 +17,21 @@ func (p *Plugin) Commands() []core.Command {
 	return []core.Command{
 		{
 			Route:       "systemd",
-			Description: "systemd manager (help)",
-			Usage:       "/systemd (subcommands: list/status/start/stop/restart/enable/disable/failed/inactive)",
+			Description: "kelola systemd (bantuan)",
+			Usage:       "/systemd  (lihat subcommand)",
 			Access:      core.AccessOwnerOnly,
 			Handle:      p.cmdHelp,
 		},
 		{
 			Route:       "systemd list",
-			Description: "list managed units",
+			Description: "daftar unit yang dikelola",
 			Usage:       "/systemd list",
 			Access:      core.AccessOwnerOnly,
 			Handle:      p.cmdList,
 		},
 		{
 			Route:       "systemd status",
-			Description: "show status for a unit (or all managed)",
+			Description: "status unit (atau semua unit yang dikelola)",
 			Usage:       "/systemd status [unit]",
 			Aliases:     []string{"systemd_st"},
 			Access:      core.AccessOwnerOnly,
@@ -39,7 +39,7 @@ func (p *Plugin) Commands() []core.Command {
 		},
 		{
 			Route:       "systemd auto",
-			Description: "show auto-recover status/config",
+			Description: "status/konfigurasi auto-recover",
 			Usage:       "/systemd auto",
 			Aliases:     []string{"systemd_autorecover", "systemd_auto"},
 			Access:      core.AccessOwnerOnly,
@@ -47,7 +47,7 @@ func (p *Plugin) Commands() []core.Command {
 		},
 		{
 			Route:       "systemd start",
-			Description: "start unit(s)",
+			Description: "start unit",
 			Usage:       "/systemd start <unit unit...>",
 			Aliases:     []string{"systemd_start"},
 			Access:      core.AccessOwnerOnly,
@@ -57,7 +57,7 @@ func (p *Plugin) Commands() []core.Command {
 		},
 		{
 			Route:       "systemd stop",
-			Description: "stop unit(s)",
+			Description: "stop unit",
 			Usage:       "/systemd stop <unit unit...>",
 			Aliases:     []string{"systemd_stop"},
 			Access:      core.AccessOwnerOnly,
@@ -67,7 +67,7 @@ func (p *Plugin) Commands() []core.Command {
 		},
 		{
 			Route:       "systemd restart",
-			Description: "restart unit(s)",
+			Description: "restart unit",
 			Usage:       "/systemd restart <unit unit...>",
 			Aliases:     []string{"systemd_restart"},
 			Access:      core.AccessOwnerOnly,
@@ -77,7 +77,7 @@ func (p *Plugin) Commands() []core.Command {
 		},
 		{
 			Route:       "systemd enable",
-			Description: "enable a unit on boot",
+			Description: "aktifkan unit saat boot",
 			Usage:       "/systemd enable <unit>",
 			Access:      core.AccessOwnerOnly,
 			Handle: func(ctx context.Context, req *core.Request) error {
@@ -86,7 +86,7 @@ func (p *Plugin) Commands() []core.Command {
 		},
 		{
 			Route:       "systemd disable",
-			Description: "disable a unit on boot",
+			Description: "matikan unit saat boot",
 			Usage:       "/systemd disable <unit>",
 			Access:      core.AccessOwnerOnly,
 			Handle: func(ctx context.Context, req *core.Request) error {
@@ -95,14 +95,14 @@ func (p *Plugin) Commands() []core.Command {
 		},
 		{
 			Route:       "systemd failed",
-			Description: "list failed managed units",
+			Description: "daftar unit gagal",
 			Usage:       "/systemd failed",
 			Access:      core.AccessOwnerOnly,
 			Handle:      p.cmdFailed,
 		},
 		{
 			Route:       "systemd inactive",
-			Description: "list inactive managed units",
+			Description: "daftar unit tidak aktif",
 			Usage:       "/systemd inactive",
 			Access:      core.AccessOwnerOnly,
 			Handle:      p.cmdInactive,

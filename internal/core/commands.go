@@ -156,12 +156,12 @@ func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
 	helper := Command{
 		Route:       "help",
 		Aliases:     []string{"h"},
-		Description: "show help",
+		Description: "tampilkan bantuan",
 		Usage:       "/help [cmd] [sub...]",
 		Access:      AccessEveryone,
 		Handle: func(ctx context.Context, req *Request) error {
 			text := m.helpText(req.Args)
-			_, _ = req.Adapter.SendText(ctx, req.Chat, text, &kit.SendOptions{DisablePreview: true})
+			_, _ = req.Adapter.SendText(ctx, req.Chat, text, &kit.SendOptions{DisablePreview: true, ParseMode: "HTML"})
 			return nil
 		},
 	}
@@ -169,6 +169,7 @@ func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
 
 	root := newRoot()
 	alias := map[string]*cmdNode{}
+	menuCandidates := make([]Command, 0, len(cmds))
 
 	for _, c := range cmds {
 		route := splitRoute(c.Route)
@@ -177,13 +178,28 @@ func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
 		}
 		cc := c // copy
 		root.add(route, cc)
+		menuCandidates = append(menuCandidates, cc)
 
 		leaf := root.find(route)
-		// auto alias for multi-token routes: "a b" -> "a_b" (useful for Telegram menu shortcuts)
-		if len(route) > 1 {
-			auto := strings.Join(route, "_")
-			if _, exists := alias[auto]; !exists {
-				alias[auto] = leaf
+		// Auto aliases to support Telegram /menu autocomplete.
+		// Telegram command names are restricted to [a-z0-9_]{1,32}.
+		//
+		// IMPORTANT:
+		// Do NOT add the canonical single-token command name itself (e.g. "systemd")
+		// into the alias map, because that would short-circuit subcommand traversal:
+		// "/systemd status" would be treated as an alias hit for "systemd" and never
+		// reach the "systemd status" route.
+		//
+		// We only add an auto-alias when it is *actually different* from the base
+		// command token (multi-token routes, or single-token routes that require
+		// sanitization such as "a-b" -> "a_b").
+		if leaf != nil {
+			if menu, ok := telegramCommandNameFromRoute(route); ok {
+				if len(route) > 1 || (len(route) == 1 && menu != route[0]) {
+					if _, exists := alias[menu]; !exists {
+						alias[menu] = leaf
+					}
+				}
 			}
 		}
 		for _, a := range c.Aliases {
@@ -192,6 +208,12 @@ func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
 				continue
 			}
 			alias[a] = leaf
+			// also add a Telegram-safe alias variant when needed (best-effort)
+			if sa := sanitizeTelegramCommand(a); sa != "" {
+				if _, exists := alias[sa]; !exists {
+					alias[sa] = leaf
+				}
+			}
 		}
 	}
 
@@ -216,6 +238,16 @@ func (m *CommandManager) SetRegistry(cmds []Command, cbs []CallbackRoute) {
 	m.cbMu.Lock()
 	m.callbacks = cb
 	m.cbMu.Unlock()
+
+	// Best-effort Telegram /menu autocomplete update (non-blocking).
+	if up, ok := m.adapter.(kit.CommandMenuUpdater); ok {
+		menu := buildTelegramMenuCommands(root, menuCandidates)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = up.UpdateMenuCommands(ctx, menu)
+		}()
+	}
 }
 
 func (m *CommandManager) DispatchLoop(ctx context.Context, updates <-chan kit.Update) error {
@@ -351,7 +383,7 @@ func (m *CommandManager) routeMessage(root context.Context, up kit.Update) {
 	// traverse subcommand tree
 	cur, ok := rootNode.child(word)
 	if !ok {
-		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, "unknown command. try /help", nil)
+		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, "perintah tidak dikenal. coba /help", nil)
 		return
 	}
 	path := []string{word}
@@ -372,7 +404,7 @@ func (m *CommandManager) routeMessage(root context.Context, up kit.Update) {
 	// If container node without handler: show help for that path
 	if cur.cmd == nil {
 		txt := m.helpText(path)
-		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, txt, &kit.SendOptions{DisablePreview: true})
+		_, _ = m.adapter.SendText(root, kit.ChatTarget{ChatID: msg.ChatID, ThreadID: msg.ThreadID}, txt, &kit.SendOptions{DisablePreview: true, ParseMode: "HTML"})
 		return
 	}
 

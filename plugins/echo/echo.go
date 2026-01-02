@@ -74,7 +74,7 @@ func (p *Plugin) Commands() []core.Command {
 	return []core.Command{
 		{
 			Route:       "echo",
-			Description: "echo back text",
+			Description: "balas ulang teks yang kamu kirim",
 			Usage:       "/echo <text>",
 			Access:      core.AccessEveryone,
 			Handle: func(ctx context.Context, req *core.Request) error {
@@ -90,8 +90,8 @@ func (p *Plugin) Commands() []core.Command {
 		{
 			Route:       "echo ui",
 			Aliases:     []string{"menu"},
-			Description: "interactive echo (inline buttons + callbacks)",
-			Usage:       "/menu <text>  OR  /echo ui <text>",
+			Description: "echo interaktif (tombol inline)",
+			Usage:       "/echo ui <text>  (atau /menu <text>)",
 			Access:      core.AccessEveryone,
 			Handle: func(ctx context.Context, req *core.Request) error {
 				c := p.cfgSnapshot()

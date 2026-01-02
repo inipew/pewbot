@@ -45,7 +45,7 @@ func (p *Plugin) Commands() []core.Command {
 		{
 			Route:       "ping",
 			Aliases:     []string{"health"},
-			Description: "health check",
+			Description: "cek kesehatan bot",
 			Usage:       "/ping",
 			Access:      core.AccessEveryone,
 			Handle: func(ctx context.Context, req *core.Request) error {
@@ -56,7 +56,7 @@ func (p *Plugin) Commands() []core.Command {
 		{
 			Route:       "uptime",
 			Aliases:     []string{"up"},
-			Description: "show process uptime",
+			Description: "tampilkan lama bot berjalan",
 			Usage:       "/uptime",
 			Access:      core.AccessEveryone,
 			Handle: func(ctx context.Context, req *core.Request) error {
@@ -67,16 +67,25 @@ func (p *Plugin) Commands() []core.Command {
 		},
 		{
 			Route:       "sysinfo",
-			Description: "runtime/system info (owner only)",
+			Description: "info runtime/sistem",
 			Usage:       "/sysinfo",
 			Access:      core.AccessOwnerOnly,
 			Handle:      p.cmdSysinfo,
 		},
 		{
-			Route:       "sched list",
+			// /sched is intentionally short: currently it's only a list command.
+			// If more subcommands are added later (add/remove/etc.), /sched will remain a sensible default.
+			Route:       "sched",
 			Aliases:     []string{"sched_list", "tasks", "task_list"},
-			Description: "list scheduled tasks (owner only)",
-			Usage:       "/sched_list",
+			Description: "daftar task terjadwal",
+			Usage:       "/sched  (atau /sched_list)",
+			Access:      core.AccessOwnerOnly,
+			Handle:      p.cmdSchedList,
+		},
+		{
+			Route:       "sched list",
+			Description: "daftar task terjadwal",
+			Usage:       "/sched list  (alias: /sched)",
 			Access:      core.AccessOwnerOnly,
 			Handle:      p.cmdSchedList,
 		},
