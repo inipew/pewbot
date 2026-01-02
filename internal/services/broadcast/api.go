@@ -33,6 +33,15 @@ func (s *Service) NewJob(name string, targets []kit.ChatTarget, text string, opt
 			}
 			s.statusMu.Unlock()
 		}
+	} else {
+		s.log.Debug("broadcast not running; dropping job", slog.String("job", id), slog.String("name", name))
+		s.statusMu.Lock()
+		if st := s.status[id]; st != nil {
+			st.DoneAt = time.Now()
+			st.Running = false
+			st.Failed = st.Total
+		}
+		s.statusMu.Unlock()
 	}
 	return id
 }
@@ -46,9 +55,12 @@ func (s *Service) Status(jobID string) (any, bool) {
 	s.statusMu.RLock()
 	defer s.statusMu.RUnlock()
 	st, ok := s.status[jobID]
-	if !ok {
+	if !ok || st == nil {
 		return nil, false
 	}
 	cp := *st
+	if len(st.Failures) > 0 {
+		cp.Failures = append([]kit.ChatTarget(nil), st.Failures...)
+	}
 	return cp, true
 }

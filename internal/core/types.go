@@ -27,12 +27,10 @@ type LoggingConfig struct {
 	File     LoggingFile     `json:"file"`
 	Telegram LoggingTelegram `json:"telegram"`
 }
-
 type LoggingFile struct {
 	Enabled bool   `json:"enabled"`
 	Path    string `json:"path"`
 }
-
 type LoggingTelegram struct {
 	Enabled    bool   `json:"enabled"`
 	ThreadID   int    `json:"thread_id"`
@@ -61,46 +59,6 @@ type BroadcasterConfig struct {
 type PluginConfigRaw struct {
 	Enabled bool            `json:"enabled"`
 	Config  json.RawMessage `json:"config,omitempty"`
-}
-
-// UnmarshalJSON disallows unknown fields to ensure removed legacy keys
-// are caught early during config reload.
-func (t *TelegramConfig) UnmarshalJSON(b []byte) error {
-	type tmp struct {
-		Token        string  `json:"token"`
-		OwnerUserIDs []int64 `json:"owner_user_ids"`
-		GroupLog     string  `json:"group_log"`
-		PollTimeout  string  `json:"poll_timeout"`
-	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	var v tmp
-	if err := dec.Decode(&v); err != nil {
-		return err
-	}
-	*t = TelegramConfig(v)
-	return nil
-}
-
-// UnmarshalJSON disallows unknown fields to ensure removed legacy keys
-// are caught early during config reload.
-func (s *SchedulerConfig) UnmarshalJSON(b []byte) error {
-	type tmp struct {
-		Enabled        bool   `json:"enabled"`
-		Workers        int    `json:"workers"`
-		DefaultTimeout string `json:"default_timeout"`
-		HistorySize    int    `json:"history_size"`
-		Timezone       string `json:"timezone,omitempty"`
-		RetryMax       int    `json:"retry_max,omitempty"`
-	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	var v tmp
-	if err := dec.Decode(&v); err != nil {
-		return err
-	}
-	*s = SchedulerConfig(v)
-	return nil
 }
 
 // UnmarshalJSON disallows unknown fields to ensure removed legacy keys

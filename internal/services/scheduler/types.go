@@ -110,6 +110,7 @@ type Service struct {
 	onceAt      map[string]time.Time
 	onceTimeout map[string]time.Duration
 	onceJob     map[string]func(ctx context.Context) error
+	onceVer     map[string]uint64
 
 	hmu       sync.Mutex
 	history   []HistoryItem

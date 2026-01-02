@@ -1,14 +1,14 @@
 // Package scheduler provides an in-process task scheduler used by pewbot services
 // and plugins.
 //
-// # Overview
+// Overview
 //
 // The scheduler runs user-provided jobs with a configurable worker pool and
 // optional rate limiting. Jobs are registered under a logical name (e.g.
 // "speedtest:auto"). Names are intended to be stable and human readable so that
 // tasks can be replaced (upserted) and removed deterministically.
 //
-// # Schedule formats
+// Schedule formats
 //
 // The scheduler accepts multiple schedule syntaxes:
 //
@@ -22,13 +22,13 @@
 // To force interpretation, callers may prefix the string with "cron:",
 // "interval:", or "every:".
 //
-// # Concurrency and overlap
+// Concurrency and overlap
 //
 // Jobs run on a worker pool. The TaskOptions overlap policy can be used to
 // either allow overlap or skip a run if the previous run is still executing.
 // A per-job timeout is applied to each run.
 //
-// # Lifecycle
+// Lifecycle
 //
 // The Service can be started/stopped at runtime (e.g. via config hot reload).
 // Registering tasks while stopped is supported: definitions are stored and

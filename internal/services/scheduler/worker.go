@@ -143,8 +143,9 @@ attemptLoop:
 	s.hmu.Lock()
 	defer s.hmu.Unlock()
 	s.history = append(s.history, item)
-	if s.cfg.HistorySize > 0 && len(s.history) > s.cfg.HistorySize {
-		s.history = s.history[len(s.history)-s.cfg.HistorySize:]
+	historySize := cfg.HistorySize
+	if historySize > 0 && len(s.history) > historySize {
+		s.history = s.history[len(s.history)-historySize:]
 	}
 }
 

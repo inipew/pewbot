@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -47,7 +49,16 @@ func (m *ConfigManager) Parse() (*Config, error) {
 		return nil, err
 	}
 	var cfg Config
-	if err := json.Unmarshal(b, &cfg); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, err
+	}
+	// reject trailing tokens (e.g. concatenated JSON)
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("invalid config: trailing data")
+		}
 		return nil, err
 	}
 	return &cfg, nil

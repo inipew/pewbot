@@ -4,11 +4,12 @@ package core
 type StopReason string
 
 const (
-	StopUnknown       StopReason = "unknown"
-	StopSIGINT        StopReason = "sigint"
-	StopSIGTERM       StopReason = "sigterm"
-	StopFatalError    StopReason = "fatal_error"
-	StopAppStop       StopReason = "app_stop"
-	StopPluginDisable StopReason = "plugin_disable"
-	StopConfigReload  StopReason = "config_reload"
+	StopUnknown          StopReason = "unknown"
+	StopSIGINT           StopReason = "sigint"
+	StopSIGTERM          StopReason = "sigterm"
+	StopFatalError       StopReason = "fatal_error"
+	StopAppStop          StopReason = "app_stop"
+	StopPluginDisable    StopReason = "plugin_disable"
+	StopPluginQuarantine StopReason = "plugin_quarantine"
+	StopConfigReload     StopReason = "config_reload"
 )

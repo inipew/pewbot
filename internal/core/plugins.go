@@ -60,7 +60,18 @@ type PluginManager struct {
 	pctx    map[string]context.Context
 	pcancel map[string]context.CancelFunc
 
+	// quarantine tracks plugins that are intentionally kept disabled due to invalid config.
+	// Most commonly this is triggered by invalid standardized timeouts.
+	quarantine map[string]quarantineState
+
 	cmdm *CommandManager
+}
+
+type quarantineState struct {
+	rawHash uint64
+	err     string
+	since   time.Time
+	count   int
 }
 
 func NewPluginManager(log *slog.Logger, cfgm *ConfigManager, deps PluginDeps, cmdm *CommandManager) *PluginManager {
@@ -77,8 +88,52 @@ func NewPluginManager(log *slog.Logger, cfgm *ConfigManager, deps PluginDeps, cm
 		baseCancel:     baseCancel,
 		pctx:           map[string]context.Context{},
 		pcancel:        map[string]context.CancelFunc{},
+		quarantine:     map[string]quarantineState{},
 		cmdm:           cmdm,
 	}
+}
+
+func (pm *PluginManager) isQuarantined(name string, rawHash uint64) bool {
+	pm.mu.Lock()
+	st, ok := pm.quarantine[name]
+	pm.mu.Unlock()
+	return ok && st.rawHash == rawHash
+}
+
+func (pm *PluginManager) clearQuarantineOnChange(name string, rawHash uint64) {
+	pm.mu.Lock()
+	st, ok := pm.quarantine[name]
+	if ok && st.rawHash != rawHash {
+		delete(pm.quarantine, name)
+		pm.mu.Unlock()
+		pm.log.Info("plugin quarantine cleared (config changed)", slog.String("plugin", name))
+		return
+	}
+	pm.mu.Unlock()
+}
+
+func (pm *PluginManager) setQuarantine(name string, rawHash uint64, err error, stage string) {
+	if err == nil {
+		return
+	}
+	errStr := err.Error()
+	pm.mu.Lock()
+	prev, ok := pm.quarantine[name]
+	// Avoid spamming logs when reconcile runs repeatedly with the same broken config.
+	if ok && prev.rawHash == rawHash && prev.err == errStr {
+		prev.count++
+		pm.quarantine[name] = prev
+		pm.mu.Unlock()
+		return
+	}
+	count := 1
+	if ok {
+		count = prev.count + 1
+	}
+	pm.quarantine[name] = quarantineState{rawHash: rawHash, err: errStr, since: time.Now(), count: count}
+	pm.mu.Unlock()
+
+	pm.log.Error("plugin quarantined", slog.String("plugin", name), slog.String("stage", stage), slog.String("err", errStr))
 }
 
 // globalDepsHash captures a small, conservative subset of config that plugins might implicitly depend on.
@@ -233,6 +288,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 		name    string
 		p       Plugin
 		raw     PluginConfigRaw
+		rawHash uint64
 		enabled bool
 		run     bool
 	}
@@ -242,7 +298,8 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 		raw, ok := cfg.Plugins[name]
 		enabled := ok && raw.Enabled
 		running := pm.run[name]
-		ops = append(ops, op{name: name, p: p, raw: raw, enabled: enabled, run: running})
+		rh := canonicalHashJSON(raw.Config)
+		ops = append(ops, op{name: name, p: p, raw: raw, rawHash: rh, enabled: enabled, run: running})
 	}
 	pm.mu.Unlock()
 
@@ -251,6 +308,18 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 	for _, o := range ops {
 		switch {
 		case o.enabled && !o.run:
+			// If config changed since last quarantine, clear it so we can retry.
+			pm.clearQuarantineOnChange(o.name, o.rawHash)
+			if pm.isQuarantined(o.name, o.rawHash) {
+				pm.log.Warn("plugin enable skipped (quarantined)", slog.String("plugin", o.name))
+				continue
+			}
+			// Standardized timeout validation is enforced via quarantine (not global config rejection).
+			if err := validateStandardTimeouts(o.name, o.raw.Config); err != nil {
+				pm.setQuarantine(o.name, o.rawHash, err, "timeouts")
+				continue
+			}
+
 			pm.log.Debug("plugin enable requested", slog.String("plugin", o.name))
 			// start: create LONG-LIVED plugin ctx from internal base ctx
 			pctx, cancel := context.WithCancel(pm.baseCtx)
@@ -272,7 +341,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
 				if err := v.ValidateConfig(cctx, o.raw.Config); err != nil {
 					ccancel()
-					pm.log.Error("plugin config validate failed", slog.String("plugin", o.name), slog.Any("err", err))
+					pm.setQuarantine(o.name, o.rawHash, fmt.Errorf("config validate: %w", err), "validate")
 					cancel()
 					continue
 				}
@@ -281,8 +350,13 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 
 			if cp, ok := o.p.(ConfigurablePlugin); ok {
 				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
-				_ = pm.safeCall("plugin.config."+o.name, func() error { return cp.OnConfigChange(cctx, o.raw.Config) })
+				err := pm.safeCall("plugin.config."+o.name, func() error { return cp.OnConfigChange(cctx, o.raw.Config) })
 				ccancel()
+				if err != nil {
+					pm.setQuarantine(o.name, o.rawHash, fmt.Errorf("config apply: %w", err), "config")
+					cancel()
+					continue
+				}
 			}
 
 			// Start should receive pctx (long-lived). We enforce timeout externally.
@@ -296,7 +370,8 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			pm.run[o.name] = true
 			pm.pctx[o.name] = pctx
 			pm.pcancel[o.name] = cancel
-			pm.lastRawHash[o.name] = canonicalHashJSON(o.raw.Config)
+			pm.lastRawHash[o.name] = o.rawHash
+			delete(pm.quarantine, o.name)
 			pm.mu.Unlock()
 
 			pm.log.Info("plugin started", slog.String("plugin", o.name))
@@ -308,7 +383,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			cancel()
 		case o.enabled && o.run:
 			if cp, ok := o.p.(ConfigurablePlugin); ok {
-				newHash := canonicalHashJSON(o.raw.Config)
+				newHash := o.rawHash
 				pm.mu.Lock()
 				oldHash := pm.lastRawHash[o.name]
 				pctx := pm.pctx[o.name]
@@ -319,21 +394,36 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 					pm.log.Debug("plugin config unchanged; skipping", slog.String("plugin", o.name))
 					break
 				}
+				// If raw config changed, enforce standardized timeout validation via quarantine.
+				if newHash != oldHash {
+					if err := validateStandardTimeouts(o.name, o.raw.Config); err != nil {
+						pm.setQuarantine(o.name, newHash, err, "timeouts")
+						stopCtx, cancel := context.WithTimeout(pm.baseCtx, callTimeout)
+						pm.stopOne(stopCtx, o.name, StopPluginQuarantine)
+						cancel()
+						break
+					}
+				}
 				if newHash == oldHash && globalChanged {
 					pm.log.Debug("plugin config unchanged, but global deps changed; reapplying", slog.String("plugin", o.name))
 				}
-				pm.mu.Lock()
-				pm.lastRawHash[o.name] = newHash
-				pm.mu.Unlock()
 				if pctx == nil {
 					pctx = pm.baseCtx
 				}
 				cctx, ccancel := context.WithTimeout(pctx, callTimeout)
 				err := pm.safeCall("plugin.config."+o.name, func() error { return cp.OnConfigChange(cctx, o.raw.Config) })
-				if err != nil {
-					pm.log.Warn("plugin config apply failed", slog.String("plugin", o.name), slog.Any("err", err))
-				}
 				ccancel()
+				if err != nil {
+					pm.setQuarantine(o.name, newHash, fmt.Errorf("config apply: %w", err), "config")
+					stopCtx, cancel := context.WithTimeout(pm.baseCtx, callTimeout)
+					pm.stopOne(stopCtx, o.name, StopPluginQuarantine)
+					cancel()
+					break
+				}
+				pm.mu.Lock()
+				pm.lastRawHash[o.name] = newHash
+				delete(pm.quarantine, o.name)
+				pm.mu.Unlock()
 			}
 		}
 	}
@@ -410,7 +500,7 @@ func (pm *PluginManager) refreshRegistryLocked(cfg *Config) {
 		}
 		pto, has := pluginCommandTimeout(cfg, name)
 
-		for _, c := range p.Commands() {
+		for _, c := range pm.safeCommands(name, p) {
 			c.PluginName = name
 			// If plugin timeout set and command doesn't override, apply it.
 			if has && c.Timeout <= 0 {
@@ -420,7 +510,7 @@ func (pm *PluginManager) refreshRegistryLocked(cfg *Config) {
 		}
 
 		if cbp, ok := p.(CallbackProvider); ok {
-			for _, r := range cbp.Callbacks() {
+			for _, r := range pm.safeCallbacks(name, cbp) {
 				r.Plugin = name // enforce plugin namespace
 				if has && r.Timeout <= 0 {
 					r.Timeout = pto
@@ -431,6 +521,40 @@ func (pm *PluginManager) refreshRegistryLocked(cfg *Config) {
 	}
 
 	pm.cmdm.SetRegistry(cmds, cbs)
+}
+
+func (pm *PluginManager) safeCommands(name string, p Plugin) (out []Command) {
+	if p == nil {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			pm.log.Error("panic in plugin Commands()",
+				slog.String("plugin", name),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
+			out = nil
+		}
+	}()
+	return p.Commands()
+}
+
+func (pm *PluginManager) safeCallbacks(name string, p CallbackProvider) (out []CallbackRoute) {
+	if p == nil {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			pm.log.Error("panic in plugin Callbacks()",
+				slog.String("plugin", name),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
+			out = nil
+		}
+	}()
+	return p.Callbacks()
 }
 
 func pluginCommandTimeout(cfg *Config, plugin string) (time.Duration, bool) {
@@ -510,13 +634,6 @@ func (pm *PluginManager) ValidateConfig(ctx context.Context, cfg *Config) error 
 	for name, p := range pm.reg {
 		raw, ok := cfg.Plugins[name]
 		enabled := ok && raw.Enabled
-		// validate standardized plugin.config.timeouts (if present)
-		if ok && len(raw.Config) > 0 {
-			if err := validateStandardTimeouts(name, raw.Config); err != nil {
-				pm.mu.Unlock()
-				return err
-			}
-		}
 		ops = append(ops, struct {
 			name string
 			p    Plugin
@@ -529,6 +646,10 @@ func (pm *PluginManager) ValidateConfig(ctx context.Context, cfg *Config) error 
 	for _, o := range ops {
 		if !o.en || o.p == nil {
 			continue
+		}
+		// Validate standardized timeouts schema if present.
+		if err := validateStandardTimeouts(o.name, o.raw.Config); err != nil {
+			return err
 		}
 		if v, ok := o.p.(ConfigValidator); ok {
 			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)

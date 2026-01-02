@@ -24,7 +24,7 @@ type Adapter struct {
 	log *slog.Logger
 
 	bot       *tele.Bot
-	out       chan<- kit.Update
+	out       atomic.Value // stores (chan<- kit.Update)
 	runCancel context.CancelFunc
 	runWG     sync.WaitGroup
 	runMu     sync.Mutex
@@ -37,6 +37,50 @@ type Adapter struct {
 	menuMu   sync.Mutex
 	menuHash uint64
 	http     *http.Client
+}
+
+func (a *Adapter) registerHandlers() {
+	// Handlers forward to the CURRENT output channel. Start() may swap it.
+	a.bot.Handle(tele.OnText, func(c tele.Context) error {
+		m := c.Message()
+		if m == nil {
+			return nil
+		}
+		up := kit.Update{
+			Kind: kit.UpdateMessage,
+			Message: &kit.Message{
+				ID:           m.ID,
+				ChatID:       m.Chat.ID,
+				ThreadID:     threadIDFromMsg(m),
+				FromID:       m.Sender.ID,
+				FromUsername: m.Sender.Username,
+				Text:         m.Text,
+			},
+		}
+		a.sendUpdate(up)
+		return nil
+	})
+
+	a.bot.Handle(tele.OnCallback, func(c tele.Context) error {
+		cb := c.Callback()
+		m := c.Message()
+		if cb == nil || m == nil {
+			return nil
+		}
+		up := kit.Update{
+			Kind: kit.UpdateCallback,
+			Callback: &kit.Callback{
+				ID:        cb.ID,
+				ChatID:    m.Chat.ID,
+				ThreadID:  threadIDFromMsg(m),
+				FromID:    cb.Sender.ID,
+				MessageID: m.ID,
+				Data:      cb.Data,
+			},
+		}
+		a.sendUpdate(up)
+		return nil
+	})
 }
 
 func New(cfg Config, log *slog.Logger) (*Adapter, error) {
@@ -54,7 +98,28 @@ func New(cfg Config, log *slog.Logger) (*Adapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Adapter{cfg: cfg, log: log, bot: b, http: &http.Client{Timeout: 8 * time.Second}}, nil
+	if log == nil {
+		log = slog.Default()
+	}
+	a := &Adapter{cfg: cfg, log: log, bot: b, http: &http.Client{Timeout: 8 * time.Second}}
+	// Ensure atomic.Value is initialized with a stable dynamic type.
+	var nilOut chan<- kit.Update
+	a.out.Store(nilOut)
+	a.registerHandlers()
+	return a, nil
+}
+
+func (a *Adapter) sendUpdate(up kit.Update) {
+	v := a.out.Load()
+	out, _ := v.(chan<- kit.Update)
+	if out == nil {
+		return
+	}
+	select {
+	case out <- up:
+	default:
+		atomic.AddUint64(&a.droppedUpdates, 1)
+	}
 }
 
 func (a *Adapter) Start(ctx context.Context, out chan<- kit.Update) error {
@@ -64,7 +129,7 @@ func (a *Adapter) Start(ctx context.Context, out chan<- kit.Update) error {
 		return nil
 	}
 	a.running = true
-	a.out = out
+	a.out.Store(out)
 	rctx, cancel := context.WithCancel(ctx)
 	a.runCancel = cancel
 	a.runWG.Add(2)
@@ -91,55 +156,6 @@ func (a *Adapter) Start(ctx context.Context, out chan<- kit.Update) error {
 		}
 	}()
 
-	a.bot.Handle(tele.OnText, func(c tele.Context) error {
-		m := c.Message()
-		if m == nil {
-			return nil
-		}
-		up := kit.Update{
-			Kind: kit.UpdateMessage,
-			Message: &kit.Message{
-				ID:           m.ID,
-				ChatID:       m.Chat.ID,
-				ThreadID:     threadIDFromMsg(m),
-				FromID:       m.Sender.ID,
-				FromUsername: m.Sender.Username,
-				Text:         m.Text,
-			},
-		}
-		select {
-		case out <- up:
-		default:
-			atomic.AddUint64(&a.droppedUpdates, 1)
-		}
-		return nil
-	})
-
-	a.bot.Handle(tele.OnCallback, func(c tele.Context) error {
-		cb := c.Callback()
-		m := c.Message()
-		if cb == nil || m == nil {
-			return nil
-		}
-		up := kit.Update{
-			Kind: kit.UpdateCallback,
-			Callback: &kit.Callback{
-				ID:        cb.ID,
-				ChatID:    m.Chat.ID,
-				ThreadID:  threadIDFromMsg(m),
-				FromID:    cb.Sender.ID,
-				MessageID: m.ID,
-				Data:      cb.Data,
-			},
-		}
-		select {
-		case out <- up:
-		default:
-			atomic.AddUint64(&a.droppedUpdates, 1)
-		}
-		return nil
-	})
-
 	go func() {
 		defer a.runWG.Done()
 		// Ensure we stop telebot when context is cancelled.
@@ -161,6 +177,8 @@ func (a *Adapter) Stop(ctx context.Context) error {
 	a.runCancel = nil
 	wasRunning := a.running
 	a.running = false
+	var nilOut chan<- kit.Update
+	a.out.Store(nilOut)
 	a.runMu.Unlock()
 
 	a.log.Info("stopping", slog.Uint64("dropped_updates_pending", atomic.LoadUint64(&a.droppedUpdates)))

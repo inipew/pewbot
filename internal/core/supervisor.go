@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 )
 
 // Supervisor manages goroutines tied to a shared context.
@@ -21,7 +22,7 @@ type Supervisor struct {
 	log         *slog.Logger
 	cancelOnErr bool
 	errOnce     sync.Once
-	firstErr    error
+	firstErr    atomic.Value // stores error
 	doneOnce    sync.Once
 	doneCh      chan struct{}
 	wg          sync.WaitGroup
@@ -57,7 +58,14 @@ func (s *Supervisor) Context() context.Context { return s.ctx }
 func (s *Supervisor) Cancel() { s.cancel() }
 
 func (s *Supervisor) Err() error {
-	return s.firstErr
+	v := s.firstErr.Load()
+	if v == nil {
+		return nil
+	}
+	if err, ok := v.(error); ok {
+		return err
+	}
+	return nil
 }
 
 func (s *Supervisor) Go(name string, fn func(ctx context.Context) error) {
@@ -125,7 +133,7 @@ func (s *Supervisor) Wait(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.doneCh:
-		return s.firstErr
+		return s.Err()
 	}
 }
 
@@ -133,5 +141,5 @@ func (s *Supervisor) setErr(err error) {
 	if err == nil {
 		return
 	}
-	s.errOnce.Do(func() { s.firstErr = err })
+	s.errOnce.Do(func() { s.firstErr.Store(err) })
 }

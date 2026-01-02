@@ -167,12 +167,6 @@ func (a *App) Start(ctx context.Context) error {
 		a.cfgm.SetLogger(a.log.With(slog.String("comp", "config")))
 		a.cfgm.SetValidator(func(c context.Context, cfg *Config) error {
 			// global validation
-			if _, err := parseDurationField("telegram.poll_timeout", cfg.Telegram.PollTimeout); err != nil {
-				return err
-			}
-			if _, err := parseDurationField("scheduler.default_timeout", cfg.Scheduler.DefaultTimeout); err != nil {
-				return err
-			}
 			if cfg.Scheduler.Workers < 0 {
 				return fmt.Errorf("scheduler.workers must be >= 0")
 			}
@@ -181,6 +175,18 @@ func (a *App) Start(ctx context.Context) error {
 			}
 			if cfg.Broadcaster.Workers < 0 {
 				return fmt.Errorf("broadcaster.workers must be >= 0")
+			}
+			// duration/timezone validation (reject bad hot-reload)
+			if _, err := parseDurationField("scheduler.default_timeout", cfg.Scheduler.DefaultTimeout); err != nil {
+				return err
+			}
+			if _, err := parseDurationField("telegram.poll_timeout", cfg.Telegram.PollTimeout); err != nil {
+				return err
+			}
+			if tz := strings.TrimSpace(cfg.Scheduler.Timezone); tz != "" {
+				if _, err := time.LoadLocation(tz); err != nil {
+					return fmt.Errorf("scheduler.timezone: invalid %q: %w", tz, err)
+				}
 			}
 			// per-plugin validation
 			if a.pm != nil {
@@ -373,11 +379,16 @@ func (a *App) Stop(ctx context.Context, reason StopReason) error {
 		}
 
 		done := make(chan error, 1)
-		go func() { done <- fn(stepCtx) }()
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					done <- fmt.Errorf("panic in stop step %s: %v", name, r)
+				}
+			}()
+			done <- fn(stepCtx)
+		}()
 
 		select {
-		case <-ctx.Done():
-			a.log.Warn("stop step cancelled", slog.String("name", name), slog.String("err", ctx.Err().Error()))
 		case err := <-done:
 			if err != nil {
 				a.log.Warn("stop step error", slog.String("name", name), slog.String("err", err.Error()))
@@ -389,8 +400,24 @@ func (a *App) Stop(ctx context.Context, reason StopReason) error {
 				a.log.Debug("stop step end", slog.String("name", name), slog.Duration("took", took))
 			}
 		case <-stepCtx.Done():
-			// step budget exceeded
-			a.log.Warn("stop step timeout (continuing)", slog.String("name", name), slog.String("err", stepCtx.Err().Error()))
+			// Contract: fn MUST honor stepCtx and return promptly. If it doesn't, log a leak signal.
+			elapsed := time.Since(start)
+			a.log.Warn(
+				"stop step deadline reached (continuing)",
+				slog.String("name", name),
+				slog.String("err", stepCtx.Err().Error()),
+				slog.Duration("elapsed", elapsed),
+			)
+			// Leak logging: observe when/if the step eventually finishes.
+			go func() {
+				err := <-done
+				took := time.Since(start)
+				if err != nil {
+					a.log.Warn("stop step finished after deadline", slog.String("name", name), slog.String("err", err.Error()), slog.Duration("took", took))
+				} else {
+					a.log.Info("stop step finished after deadline", slog.String("name", name), slog.Duration("took", took))
+				}
+			}()
 		}
 	}
 
