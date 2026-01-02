@@ -15,9 +15,12 @@ func (p *Plugin) runSpeedtest(ctx context.Context) (*SpeedtestResult, string, er
 
 	// Create timeout context
 	p.mu.RLock()
-	timeout := time.Duration(p.cfg.Timeout) * time.Second
+	timeout := p.cfg.operationTimeout
 	serverCount := p.cfg.ServerCount
 	p.mu.RUnlock()
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

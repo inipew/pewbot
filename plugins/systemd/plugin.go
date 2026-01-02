@@ -3,17 +3,19 @@ package systemd
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
+	"fmt"
 	"sync"
 	"time"
 
 	"pewbot/internal/core"
+	"pewbot/internal/pluginkit"
 	sm "pewbot/pkg/systemdmanager"
 )
 
-type AutoRecoverConfig struct {
-	Enabled         bool   `json:"enabled"`
-	Interval        string `json:"interval"`
+// AutoRecoverOptions configures the behavior of the auto-recover feature.
+//
+// Scheduling is configured via Config.Scheduler.
+type AutoRecoverOptions struct {
 	MinDown         string `json:"min_down"`
 	BackoffBase     string `json:"backoff_base"`
 	BackoffMax      string `json:"backoff_max"`
@@ -23,9 +25,13 @@ type AutoRecoverConfig struct {
 }
 
 type Config struct {
-	Prefix      string            `json:"prefix"`
-	AllowUnits  []string          `json:"allow_units"`
-	AutoRecover AutoRecoverConfig `json:"auto_recover"`
+	Prefix      string                        `json:"prefix"`
+	AllowUnits  []string                      `json:"allow_units"`
+	Scheduler   pluginkit.SchedulerTaskConfig `json:"scheduler"`
+	Timeouts    pluginkit.TimeoutsConfig      `json:"timeouts,omitempty"`
+	AutoRecover AutoRecoverOptions            `json:"auto_recover"`
+
+	allowSet map[string]struct{} `json:"-"`
 }
 
 type unitRecoverState struct {
@@ -37,60 +43,40 @@ type unitRecoverState struct {
 }
 
 type Plugin struct {
-	log  *slog.Logger
-	deps core.PluginDeps
+	pluginkit.EnhancedPluginBase
 
-	mu     sync.RWMutex
-	cfg    Config
-	runCtx context.Context
-
+	mu  sync.RWMutex
+	cfg Config
 	mgr *sm.ServiceManager
 
-	// plugin-owned lifecycle for auto-recover schedule (safe under hot-reload)
-	autoMu             sync.Mutex
-	autoRecoverRunning int32 // atomic guard
-	recoverState       map[string]*unitRecoverState
-	missingWarned      map[string]bool
+	autoMu       sync.Mutex
+	recoverState map[string]*unitRecoverState
+	missingWarn  map[string]bool
+	autoTask     string // last scheduled short name
 }
 
-func New() *Plugin {
-	return &Plugin{}
-}
+func New() *Plugin             { return &Plugin{} }
 func (p *Plugin) Name() string { return "systemd" }
 
 func (p *Plugin) Init(ctx context.Context, deps core.PluginDeps) error {
-	p.deps = deps
-	p.log = deps.Logger.With(slog.String("plugin", p.Name()))
+	p.InitEnhanced(deps, p.Name())
 	return nil
 }
 
 func (p *Plugin) Start(ctx context.Context) error {
-	// ctx here is the long-lived plugin ctx (cancelled on stop)
-	p.mu.Lock()
-	p.runCtx = ctx
-	cfg := p.cfg
-	p.mu.Unlock()
-
-	// Ensure manager exists (in case OnConfigChange ran before Start but failed, or config applied after)
+	p.StartEnhanced(ctx)
+	cfg := p.cfgSnapshot()
 	p.ensureManager(cfg.AllowUnits)
-
-	p.stopAutoRecover()
-	p.startAutoRecover(ctx, cfg)
+	p.reconcileAutoRecover(ctx, cfg)
 	return nil
 }
 
 func (p *Plugin) Stop(ctx context.Context) error {
-	p.mu.Lock()
-	p.runCtx = nil
-	p.mu.Unlock()
-
-	p.stopAutoRecover()
-
-	if p.mgr != nil {
-		_ = p.mgr.Close()
-		p.mgr = nil
-	}
-	return nil
+	// Stop schedules first (auto cleanup), then tear down plugin-owned resources.
+	err := p.StopEnhanced(ctx)
+	p.resetAutoState()
+	p.closeManager()
+	return err
 }
 
 func (p *Plugin) OnConfigChange(ctx context.Context, raw json.RawMessage) error {
@@ -101,73 +87,121 @@ func (p *Plugin) OnConfigChange(ctx context.Context, raw json.RawMessage) error 
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return err
 	}
+
+	// defaults
 	if c.Prefix == "" {
 		c.Prefix = "svc: "
 	}
 	c.AllowUnits = normalizeUnits(c.AllowUnits)
+	c.allowSet = make(map[string]struct{}, len(c.AllowUnits))
+	for _, u := range c.AllowUnits {
+		c.allowSet[u] = struct{}{}
+	}
+	applyAutoRecoverDefaults(&c.AutoRecover)
 
-	// auto-recover defaults
-	if c.AutoRecover.BackoffBase == "" {
-		c.AutoRecover.BackoffBase = "5s"
+	// Validate optional standardized timeouts.
+	if err := c.Timeouts.Validate("systemd.timeouts"); err != nil {
+		return err
 	}
-	if c.AutoRecover.BackoffMax == "" {
-		c.AutoRecover.BackoffMax = "5m"
+
+	// Scheduler defaults.
+	if c.Scheduler.TaskName == "" {
+		c.Scheduler.TaskName = "auto_recover"
 	}
-	if c.AutoRecover.AlertInterval == "" {
-		c.AutoRecover.AlertInterval = "10m"
+	if c.Scheduler.Enabled && c.Scheduler.Schedule == "" {
+		return fmt.Errorf("systemd.scheduler.schedule is required when scheduler.enabled=true")
 	}
-	if c.AutoRecover.RestartTimeout == "" {
-		c.AutoRecover.RestartTimeout = "15s"
-	}
-	if c.AutoRecover.FailAlertStreak <= 0 {
-		c.AutoRecover.FailAlertStreak = 3
+	if c.Scheduler.Enabled {
+		if _, err := core.ParseSchedule(c.Scheduler.Schedule); err != nil {
+			return fmt.Errorf("invalid systemd.scheduler.schedule: %w", err)
+		}
 	}
 
 	p.mu.Lock()
 	p.cfg = c
-	run := p.runCtx // snapshot
 	p.mu.Unlock()
 
 	p.ensureManager(c.AllowUnits)
 
-	// Only restart background loop if plugin already started (run ctx available).
+	// Only reconcile background schedules if running.
+	run := p.Context()
 	if run != nil {
-		p.stopAutoRecover()
-		p.startAutoRecover(run, c)
+		p.reconcileAutoRecover(ctx, c)
 	}
 	return nil
+}
+
+func (p *Plugin) cfgSnapshot() Config {
+	p.mu.RLock()
+	c := p.cfg
+	c.AllowUnits = append([]string(nil), p.cfg.AllowUnits...)
+	p.mu.RUnlock()
+	return c
+}
+
+func (p *Plugin) mgrSnapshot() *sm.ServiceManager {
+	p.mu.RLock()
+	m := p.mgr
+	p.mu.RUnlock()
+	return m
+}
+
+func (p *Plugin) closeManager() {
+	p.mu.Lock()
+	m := p.mgr
+	p.mgr = nil
+	p.mu.Unlock()
+	if m != nil {
+		_ = m.Close()
+	}
 }
 
 func (p *Plugin) ensureManager(allow []string) {
 	// if no allow list, keep manager nil
 	if len(allow) == 0 {
-		if p.mgr != nil {
-			_ = p.mgr.Close()
-			p.mgr = nil
-		}
+		p.closeManager()
 		return
 	}
-	// Recreate manager if nil or allow list changed.
-	need := false
-	if p.mgr == nil {
-		need = true
-	} else {
-		cur := p.mgr.GetManagedServices()
-		if !sameStringSlice(cur, allow) {
-			need = true
+
+	p.mu.RLock()
+	cur := p.mgr
+	p.mu.RUnlock()
+
+	if cur != nil {
+		managed := cur.GetManagedServices()
+		if sameStringSlice(managed, allow) {
+			return
 		}
+		p.closeManager()
 	}
-	if !need {
-		return
-	}
-	if p.mgr != nil {
-		_ = p.mgr.Close()
-		p.mgr = nil
-	}
+
 	mgr, err := sm.NewServiceManager(allow)
 	if err != nil {
-		p.log.Warn("failed to create systemd manager", slog.String("err", err.Error()))
+		p.Log.Warn("failed to create systemd manager", "err", err)
 		return
 	}
+	p.mu.Lock()
 	p.mgr = mgr
+	p.mu.Unlock()
+}
+
+func applyAutoRecoverDefaults(c *AutoRecoverOptions) {
+	if c.BackoffBase == "" {
+		c.BackoffBase = "5s"
+	}
+	if c.BackoffMax == "" {
+		c.BackoffMax = "5m"
+	}
+	if c.AlertInterval == "" {
+		c.AlertInterval = "10m"
+	}
+	if c.RestartTimeout == "" {
+		c.RestartTimeout = "15s"
+	}
+	if c.MinDown == "" {
+		c.MinDown = "3s"
+	}
+	if c.FailAlertStreak <= 0 {
+		c.FailAlertStreak = 3
+	}
 }

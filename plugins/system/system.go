@@ -2,7 +2,7 @@ package system
 
 import (
 	"context"
-	"log/slog"
+	"fmt"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -11,23 +11,34 @@ import (
 
 	"pewbot/internal/core"
 	"pewbot/internal/kit"
+	"pewbot/internal/pluginkit"
 )
 
 type Plugin struct {
-	log  *slog.Logger
-	deps core.PluginDeps
+	pluginkit.EnhancedPluginBase
+	startedAt time.Time
 }
 
 func New() *Plugin             { return &Plugin{} }
 func (p *Plugin) Name() string { return "system" }
 
 func (p *Plugin) Init(ctx context.Context, deps core.PluginDeps) error {
-	p.deps = deps
-	p.log = deps.Logger.With(slog.String("plugin", p.Name()))
+	p.InitEnhanced(deps, p.Name())
+	if p.startedAt.IsZero() {
+		p.startedAt = time.Now()
+	}
 	return nil
 }
-func (p *Plugin) Start(ctx context.Context) error { return nil }
-func (p *Plugin) Stop(ctx context.Context) error  { return nil }
+
+func (p *Plugin) Start(ctx context.Context) error {
+	p.StartEnhanced(ctx)
+	if p.startedAt.IsZero() {
+		p.startedAt = time.Now()
+	}
+	return nil
+}
+
+func (p *Plugin) Stop(ctx context.Context) error { return p.StopEnhanced(ctx) }
 
 func (p *Plugin) Commands() []core.Command {
 	return []core.Command{
@@ -43,33 +54,24 @@ func (p *Plugin) Commands() []core.Command {
 			},
 		},
 		{
+			Route:       "uptime",
+			Aliases:     []string{"up"},
+			Description: "show process uptime",
+			Usage:       "/uptime",
+			Access:      core.AccessEveryone,
+			Handle: func(ctx context.Context, req *core.Request) error {
+				up := time.Since(p.startedAt)
+				_, _ = req.Adapter.SendText(ctx, req.Chat, "uptime: "+durRel(up), nil)
+				return nil
+			},
+		},
+		{
 			Route:       "sysinfo",
 			Description: "runtime/system info (owner only)",
 			Usage:       "/sysinfo",
 			Access:      core.AccessOwnerOnly,
-			Handle: func(ctx context.Context, req *core.Request) error {
-				var m runtime.MemStats
-				runtime.ReadMemStats(&m)
-
-				bi, _ := debug.ReadBuildInfo()
-				mod := ""
-				if bi != nil {
-					mod = bi.Main.Path + " " + bi.Main.Version
-				}
-				msg := strings.Join([]string{
-					"🧠 *sysinfo*",
-					"- go: " + runtime.Version(),
-					"- module: " + mod,
-					"- goroutines: " + itoa(runtime.NumGoroutine()),
-					"- mem_alloc: " + bytes(m.Alloc),
-					"- mem_sys: " + bytes(m.Sys),
-				}, "\n")
-
-				_, _ = req.Adapter.SendText(ctx, req.Chat, msg, &kit.SendOptions{ParseMode: "Markdown"})
-				return nil
-			},
+			Handle:      p.cmdSysinfo,
 		},
-
 		{
 			Route:       "sched list",
 			Aliases:     []string{"sched_list", "tasks", "task_list"},
@@ -81,55 +83,34 @@ func (p *Plugin) Commands() []core.Command {
 	}
 }
 
-// lightweight helpers (avoid extra deps)
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-	var b [32]byte
-	pos := len(b)
-	for i > 0 {
-		pos--
-		b[pos] = byte('0' + (i % 10))
-		i /= 10
-	}
-	if neg {
-		pos--
-		b[pos] = '-'
-	}
-	return string(b[pos:])
-}
+func (p *Plugin) cmdSysinfo(ctx context.Context, req *core.Request) error {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
 
-func bytes(n uint64) string {
-	const (
-		KB = 1024
-		MB = 1024 * KB
-		GB = 1024 * MB
-	)
-	switch {
-	case n >= GB:
-		return fmt2(n, GB, "GB")
-	case n >= MB:
-		return fmt2(n, MB, "MB")
-	case n >= KB:
-		return fmt2(n, KB, "KB")
-	default:
-		return itoa(int(n)) + "B"
+	bi, _ := debug.ReadBuildInfo()
+	mod := ""
+	if bi != nil {
+		mod = bi.Main.Path + " " + bi.Main.Version
 	}
-}
 
-func fmt2(n, div uint64, unit string) string {
-	x := float64(n) / float64(div)
-	ix := int(x * 10) // 1 decimal
-	return itoa(ix/10) + "." + itoa(ix%10) + unit
+	msg := strings.Join([]string{
+		"🧠 *sysinfo*",
+		"- go: " + runtime.Version(),
+		"- module: " + mod,
+		fmt.Sprintf("- goroutines: %d", runtime.NumGoroutine()),
+		"- mem_alloc: " + fmtBytes(m.Alloc),
+		"- mem_sys: " + fmtBytes(m.Sys),
+	}, "\n")
+
+	_, _ = req.Adapter.SendText(ctx, req.Chat, msg, &kit.SendOptions{ParseMode: "Markdown"})
+	return nil
 }
 
 func (p *Plugin) cmdSchedList(ctx context.Context, req *core.Request) error {
-	s := p.deps.Services.Scheduler
+	var s core.SchedulerPort
+	if p.Deps.Services != nil {
+		s = p.Deps.Services.Scheduler
+	}
 	if s == nil || !s.Enabled() {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, "scheduler is disabled", nil)
 		return nil
@@ -141,13 +122,12 @@ func (p *Plugin) cmdSchedList(ctx context.Context, req *core.Request) error {
 		return nil
 	}
 
-	// sort by name for stable output
 	sort.Slice(snap.Schedules, func(i, j int) bool { return snap.Schedules[i].Name < snap.Schedules[j].Name })
 
 	now := time.Now()
 	lines := make([]string, 0, len(snap.Schedules)+3)
 	lines = append(lines, "⏱ scheduled tasks ("+snap.Timezone+"):")
-	lines = append(lines, "- workers: "+itoa(snap.Workers)+", queue: "+itoa(snap.QueueLen))
+	lines = append(lines, fmt.Sprintf("- workers: %d, queue: %d", snap.Workers, snap.QueueLen))
 
 	for _, t := range snap.Schedules {
 		next := "-"
@@ -161,11 +141,29 @@ func (p *Plugin) cmdSchedList(ctx context.Context, req *core.Request) error {
 		if t.Timeout > 0 {
 			timeout = t.Timeout.String()
 		}
-		lines = append(lines, "- "+t.Name+": spec="+t.Spec+", next="+next+", timeout="+timeout)
+		lines = append(lines, fmt.Sprintf("- %s: spec=%s, next=%s, timeout=%s", t.Name, t.Spec, next, timeout))
 	}
 
 	_, _ = req.Adapter.SendText(ctx, req.Chat, strings.Join(lines, "\n"), &kit.SendOptions{DisablePreview: true})
 	return nil
+}
+
+func fmtBytes(n uint64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+	switch {
+	case n >= GB:
+		return fmt.Sprintf("%.1fGB", float64(n)/GB)
+	case n >= MB:
+		return fmt.Sprintf("%.1fMB", float64(n)/MB)
+	case n >= KB:
+		return fmt.Sprintf("%.1fKB", float64(n)/KB)
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 func durRel(d time.Duration) string {
@@ -173,14 +171,14 @@ func durRel(d time.Duration) string {
 		d = -d
 	}
 	if d < time.Minute {
-		return itoa(int(d.Seconds())) + "s"
+		return fmt.Sprintf("%ds", int(d.Seconds()))
 	}
 	if d < time.Hour {
 		m := int(d.Minutes())
 		s := int(d.Seconds()) % 60
-		return itoa(m) + "m" + itoa(s) + "s"
+		return fmt.Sprintf("%dm%ds", m, s)
 	}
 	h := int(d.Hours())
 	m := int(d.Minutes()) % 60
-	return itoa(h) + "h" + itoa(m) + "m"
+	return fmt.Sprintf("%dh%dm", h, m)
 }

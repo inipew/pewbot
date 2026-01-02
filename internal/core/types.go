@@ -1,8 +1,8 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
-	"time"
 )
 
 type Config struct {
@@ -14,10 +14,11 @@ type Config struct {
 }
 
 type TelegramConfig struct {
-	Token          string  `json:"token"`
-	OwnerUserIDs   []int64 `json:"owner_user_ids"`
-	GroupLog       string  `json:"group_log"`
-	PollTimeoutSec int     `json:"poll_timeout_sec"`
+	Token        string  `json:"token"`
+	OwnerUserIDs []int64 `json:"owner_user_ids"`
+	GroupLog     string  `json:"group_log"`
+	// PollTimeout is a Go duration string (e.g. "10s", "2m").
+	PollTimeout string `json:"poll_timeout"`
 }
 
 type LoggingConfig struct {
@@ -26,10 +27,12 @@ type LoggingConfig struct {
 	File     LoggingFile     `json:"file"`
 	Telegram LoggingTelegram `json:"telegram"`
 }
+
 type LoggingFile struct {
 	Enabled bool   `json:"enabled"`
 	Path    string `json:"path"`
 }
+
 type LoggingTelegram struct {
 	Enabled    bool   `json:"enabled"`
 	ThreadID   int    `json:"thread_id"`
@@ -38,12 +41,14 @@ type LoggingTelegram struct {
 }
 
 type SchedulerConfig struct {
-	Enabled          bool   `json:"enabled"`
-	Workers          int    `json:"workers"`
-	DefaultTimeoutMS int    `json:"default_timeout_ms"`
-	HistorySize      int    `json:"history_size"`
-	Timezone         string `json:"timezone,omitempty"`
-	RetryMax         int    `json:"retry_max,omitempty"`
+	Enabled bool `json:"enabled"`
+	Workers int  `json:"workers"`
+	// DefaultTimeout is a Go duration string (e.g. "10s", "1m").
+	// Use "0s" to disable a global default timeout.
+	DefaultTimeout string `json:"default_timeout"`
+	HistorySize    int    `json:"history_size"`
+	Timezone       string `json:"timezone,omitempty"`
+	RetryMax       int    `json:"retry_max,omitempty"`
 }
 
 type BroadcasterConfig struct {
@@ -55,17 +60,62 @@ type BroadcasterConfig struct {
 
 type PluginConfigRaw struct {
 	Enabled bool            `json:"enabled"`
-	Timeout string          `json:"timeout,omitempty"`
 	Config  json.RawMessage `json:"config,omitempty"`
 }
 
-func (p PluginConfigRaw) TimeoutDuration() (time.Duration, bool) {
-	if p.Timeout == "" {
-		return 0, false
+// UnmarshalJSON disallows unknown fields to ensure removed legacy keys
+// are caught early during config reload.
+func (t *TelegramConfig) UnmarshalJSON(b []byte) error {
+	type tmp struct {
+		Token        string  `json:"token"`
+		OwnerUserIDs []int64 `json:"owner_user_ids"`
+		GroupLog     string  `json:"group_log"`
+		PollTimeout  string  `json:"poll_timeout"`
 	}
-	d, err := time.ParseDuration(p.Timeout)
-	if err != nil {
-		return 0, false
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var v tmp
+	if err := dec.Decode(&v); err != nil {
+		return err
 	}
-	return d, true
+	*t = TelegramConfig(v)
+	return nil
+}
+
+// UnmarshalJSON disallows unknown fields to ensure removed legacy keys
+// are caught early during config reload.
+func (s *SchedulerConfig) UnmarshalJSON(b []byte) error {
+	type tmp struct {
+		Enabled        bool   `json:"enabled"`
+		Workers        int    `json:"workers"`
+		DefaultTimeout string `json:"default_timeout"`
+		HistorySize    int    `json:"history_size"`
+		Timezone       string `json:"timezone,omitempty"`
+		RetryMax       int    `json:"retry_max,omitempty"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var v tmp
+	if err := dec.Decode(&v); err != nil {
+		return err
+	}
+	*s = SchedulerConfig(v)
+	return nil
+}
+
+// UnmarshalJSON disallows unknown fields to ensure removed legacy keys
+// (e.g. "timeout") are caught early during config reload.
+func (p *PluginConfigRaw) UnmarshalJSON(b []byte) error {
+	type tmp struct {
+		Enabled bool            `json:"enabled"`
+		Config  json.RawMessage `json:"config,omitempty"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var t tmp
+	if err := dec.Decode(&t); err != nil {
+		return err
+	}
+	*p = PluginConfigRaw{Enabled: t.Enabled, Config: t.Config}
+	return nil
 }

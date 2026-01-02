@@ -11,16 +11,14 @@ import (
 
 // Config defines plugin configuration
 type Config struct {
-	Prefix      string `json:"prefix"`
-	AutoSpeed   Auto   `json:"auto_speedtest"`
-	HistoryFile string `json:"history_file"`
-	ServerCount int    `json:"server_count"`
-	Timeout     int    `json:"timeout_seconds"` // timeout per test
-}
+	Prefix      string                        `json:"prefix"`
+	Scheduler   pluginkit.SchedulerTaskConfig `json:"scheduler"`
+	Timeouts    pluginkit.TimeoutsConfig      `json:"timeouts,omitempty"`
+	HistoryFile string                        `json:"history_file"`
+	ServerCount int                           `json:"server_count"`
 
-// Auto defines auto speedtest schedule
-type Auto struct {
-	Schedule string `json:"schedule"`
+	taskTimeout      time.Duration `json:"-"`
+	operationTimeout time.Duration `json:"-"`
 }
 
 // SpeedtestResult represents test results
@@ -71,7 +69,8 @@ type DailyStats struct {
 // Plugin implements speedtest functionality
 type Plugin struct {
 	pluginkit.EnhancedPluginBase
-	cfg     Config
-	history *SpeedtestHistory
-	mu      sync.RWMutex
+	cfg      Config
+	history  *SpeedtestHistory
+	mu       sync.RWMutex
+	autoTask string // last scheduled short name
 }

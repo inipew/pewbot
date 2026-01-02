@@ -9,7 +9,7 @@ import (
 
 // SummarizeConfigChange returns (1) a compact list of changed sections,
 // (2) safe structured attrs for logging (never includes secrets like tokens),
-// and (3) a list of plugin names that changed (enable/timeout/config).
+// and (3) a list of plugin names that changed (enable/config).
 func SummarizeConfigChange(oldCfg, newCfg *Config) ([]string, []slog.Attr, []string) {
 	if oldCfg == nil {
 		oldCfg = &Config{}
@@ -22,12 +22,12 @@ func SummarizeConfigChange(oldCfg, newCfg *Config) ([]string, []slog.Attr, []str
 	attrs := make([]slog.Attr, 0, 16)
 
 	// Telegram (never log token)
-	if oldCfg.Telegram.PollTimeoutSec != newCfg.Telegram.PollTimeoutSec ||
+	if strings.TrimSpace(oldCfg.Telegram.PollTimeout) != strings.TrimSpace(newCfg.Telegram.PollTimeout) ||
 		!reflect.DeepEqual(oldCfg.Telegram.OwnerUserIDs, newCfg.Telegram.OwnerUserIDs) ||
 		strings.TrimSpace(oldCfg.Telegram.GroupLog) != strings.TrimSpace(newCfg.Telegram.GroupLog) {
 		changed = append(changed, "telegram")
 		attrs = append(attrs,
-			slog.Int("telegram.poll_timeout_sec", newCfg.Telegram.PollTimeoutSec),
+			slog.String("telegram.poll_timeout", strings.TrimSpace(newCfg.Telegram.PollTimeout)),
 			slog.Int("telegram.owner_count", len(newCfg.Telegram.OwnerUserIDs)),
 			slog.Bool("telegram.group_log_set", strings.TrimSpace(newCfg.Telegram.GroupLog) != ""),
 		)
@@ -121,10 +121,6 @@ func diffPlugins(oldM, newM map[string]PluginConfigRaw) []string {
 		o := oldM[name]
 		n := newM[name]
 		if o.Enabled != n.Enabled {
-			out = append(out, name)
-			continue
-		}
-		if strings.TrimSpace(o.Timeout) != strings.TrimSpace(n.Timeout) {
 			out = append(out, name)
 			continue
 		}

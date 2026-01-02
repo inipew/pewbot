@@ -3,113 +3,156 @@ package systemd
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"math/rand"
-	"strconv"
-	"strings"
-	"sync/atomic"
 	"time"
 
-	"pewbot/internal/kit"
-	sch "pewbot/internal/services/scheduler"
 	sm "pewbot/pkg/systemdmanager"
 )
 
-// ---- auto-recover loop ----
+type autoParams struct {
+	minDown        time.Duration
+	restartTimeout time.Duration
+	backoffBase    time.Duration
+	backoffMax     time.Duration
+	alertEvery     time.Duration
+	alertStreak    int
+	jobTimeout     time.Duration
+}
 
-func (p *Plugin) stopAutoRecover() {
-	// Stop scheduled auto-recover job if any
-	s := p.deps.Services.Scheduler
-	if s != nil {
-		_ = s.Remove("systemd:auto-recover")
-	}
-
-	// reset runtime state
+func (p *Plugin) resetAutoState() {
 	p.autoMu.Lock()
-	atomic.StoreInt32(&p.autoRecoverRunning, 0)
 	p.recoverState = nil
-	p.missingWarned = nil
+	p.missingWarn = nil
 	p.autoMu.Unlock()
 }
 
-func (p *Plugin) startAutoRecover(parent context.Context, cfg Config) {
-	if !cfg.AutoRecover.Enabled || p.mgr == nil {
+func (p *Plugin) reconcileAutoRecover(ctx context.Context, cfg Config) {
+	// Always clear any existing schedule/state on reconcile.
+	if p.Schedule() != nil {
+		p.autoMu.Lock()
+		old := p.autoTask
+		p.autoMu.Unlock()
+		if old != "" {
+			p.Schedule().Remove(old)
+		}
+	}
+	p.resetAutoState()
+
+	sc := cfg.Scheduler
+	name := sc.NameOr("auto_recover")
+	if !sc.Active() {
+		p.autoMu.Lock()
+		p.autoTask = ""
+		p.autoMu.Unlock()
+		p.Log.Debug("auto-recover disabled")
 		return
 	}
 
-	s := p.deps.Services.Scheduler
-	if s == nil || !s.Enabled() {
-		p.log.Warn("auto-recover skipped (scheduler disabled)")
+	mgr := p.mgrSnapshot()
+	if mgr == nil {
+		p.Log.Warn("auto-recover skipped (systemd manager not available)")
+		return
+	}
+	if p.Schedule() == nil {
+		p.Log.Warn("auto-recover skipped (scheduler not available)")
 		return
 	}
 
-	interval := mustDur(cfg.AutoRecover.Interval, 30*time.Second)
-	minDown := mustDur(cfg.AutoRecover.MinDown, 3*time.Second)
-	backoffBase := mustDur(cfg.AutoRecover.BackoffBase, 5*time.Second)
-	backoffMax := mustDur(cfg.AutoRecover.BackoffMax, 5*time.Minute)
-	alertEvery := mustDur(cfg.AutoRecover.AlertInterval, 10*time.Minute)
-	restartTimeout := mustDur(cfg.AutoRecover.RestartTimeout, 15*time.Second)
-	alertStreak := cfg.AutoRecover.FailAlertStreak
+	ap := parseAutoParams(cfg.AutoRecover, len(cfg.AllowUnits))
+
+	// Initialize state maps.
+	p.autoMu.Lock()
+	p.recoverState = map[string]*unitRecoverState{}
+	p.missingWarn = map[string]bool{}
+	p.autoMu.Unlock()
+
+	// Operation timeout is applied to per-unit status checks.
+	opTO := cfg.Timeouts.OperationOr(2 * time.Second)
+
+	// Validate allowlist once at startup/reload.
+	p.validateAllowlistOnce(ctx, mgr, cfg.AllowUnits, opTO)
+
+	taskTO := cfg.Timeouts.TaskOr(ap.jobTimeout)
+	if cfg.Timeouts.Task != "" && taskTO < ap.restartTimeout+5*time.Second {
+		p.Log.Warn("task timeout is shorter than restart_timeout; restarts may be cut off",
+			"task_timeout", taskTO,
+			"restart_timeout", ap.restartTimeout,
+		)
+	}
+
+	err := p.Schedule().Spec(name, sc.Schedule).
+		Timeout(taskTO).
+		SkipIfRunning().
+		Do(func(jobCtx context.Context) error {
+			// task ctx already includes scheduler timeout; keep restart operations bounded too.
+			return p.autoRecoverTick(jobCtx, mgr, cfg.AllowUnits, ap, opTO)
+		})
+	if err != nil {
+		p.Log.Error("auto-recover schedule failed", "err", err)
+		return
+	}
+
+	if err == nil {
+		p.autoMu.Lock()
+		p.autoTask = name
+		p.autoMu.Unlock()
+	}
+
+	p.Log.Info("auto-recover scheduled",
+		"task", name,
+		"spec", sc.Schedule,
+		"min_down", ap.minDown,
+		"restart_timeout", ap.restartTimeout,
+		"backoff_base", ap.backoffBase,
+		"backoff_max", ap.backoffMax,
+		"alert_streak", ap.alertStreak,
+		"alert_interval", ap.alertEvery,
+		"task_timeout", taskTO,
+		"operation_timeout", opTO,
+	)
+}
+
+func parseAutoParams(c AutoRecoverOptions, unitCount int) autoParams {
+	minDown := mustDur(c.MinDown, 3*time.Second)
+	restartTimeout := mustDur(c.RestartTimeout, 15*time.Second)
+	backoffBase := mustDur(c.BackoffBase, 5*time.Second)
+	backoffMax := mustDur(c.BackoffMax, 5*time.Minute)
+	alertEvery := mustDur(c.AlertInterval, 10*time.Minute)
+	alertStreak := c.FailAlertStreak
 	if alertStreak <= 0 {
 		alertStreak = 3
 	}
-
-	// ensure a clean schedule on start/reload
-	_ = s.Remove("systemd:auto-recover")
-
-	// reset state for new schedule
-	p.autoMu.Lock()
-	p.recoverState = map[string]*unitRecoverState{}
-	p.missingWarned = map[string]bool{}
-	p.autoMu.Unlock()
-
-	// validate allowlist once: warn about missing units and skip them in ticks
-	p.validateAllowlistOnce(parent)
-
-	_, err := s.AddIntervalOpt(
-		"systemd:auto-recover",
-		interval,
-		0,
-		sch.TaskOptions{Overlap: sch.OverlapSkipIfRunning},
-		func(ctx context.Context) error {
-			select {
-			case <-parent.Done():
-				return nil
-			default:
-			}
-			// extra guard (cheap)
-			if !atomic.CompareAndSwapInt32(&p.autoRecoverRunning, 0, 1) {
-				return nil
-			}
-			defer atomic.StoreInt32(&p.autoRecoverRunning, 0)
-			return p.autoRecoverTick(ctx, minDown, restartTimeout, backoffBase, backoffMax, alertStreak, alertEvery)
-		},
-	)
-	if err != nil {
-		p.log.Error("auto-recover schedule failed", slog.String("err", err.Error()))
-		return
+	// Allow enough time to check multiple units sequentially.
+	if unitCount < 1 {
+		unitCount = 1
 	}
-
-	p.log.Info("auto-recover scheduled",
-		slog.Duration("interval", interval),
-		slog.Duration("min_down", minDown),
-		slog.Duration("backoff_base", backoffBase),
-		slog.Duration("backoff_max", backoffMax),
-		slog.Int("alert_streak", alertStreak),
-	)
+	jobTimeout := time.Duration(unitCount)*restartTimeout + 15*time.Second
+	if jobTimeout < 30*time.Second {
+		jobTimeout = 30 * time.Second
+	}
+	if jobTimeout > 5*time.Minute {
+		jobTimeout = 5 * time.Minute
+	}
+	return autoParams{
+		minDown:        minDown,
+		restartTimeout: restartTimeout,
+		backoffBase:    backoffBase,
+		backoffMax:     backoffMax,
+		alertEvery:     alertEvery,
+		alertStreak:    alertStreak,
+		jobTimeout:     jobTimeout,
+	}
 }
 
-func (p *Plugin) validateAllowlistOnce(parent context.Context) {
-	mgr := p.mgr
-	if mgr == nil {
+func (p *Plugin) validateAllowlistOnce(parent context.Context, mgr *sm.ServiceManager, units []string, opTO time.Duration) {
+	if mgr == nil || len(units) == 0 {
 		return
 	}
+	if opTO <= 0 {
+		opTO = 2 * time.Second
+	}
 
-	p.mu.RLock()
-	units := append([]string(nil), p.cfg.AllowUnits...)
-	p.mu.RUnlock()
-
-	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	ctx, cancel := context.WithTimeout(parent, opTO)
 	defer cancel()
 
 	for _, u := range units {
@@ -121,10 +164,10 @@ func (p *Plugin) validateAllowlistOnce(parent context.Context) {
 			p.autoMu.Lock()
 			us := p.ensureUnitStateLocked(u)
 			us.Missing = true
-			p.missingWarned[u] = true
+			p.missingWarn[u] = true
 			p.autoMu.Unlock()
 
-			p.log.Warn("auto-recover skipping missing unit", slog.String("unit", u))
+			p.Log.Warn("auto-recover skipping missing unit", "unit", u)
 		}
 	}
 }
@@ -142,7 +185,6 @@ func (p *Plugin) ensureUnitStateLocked(unit string) *unitRecoverState {
 }
 
 func (p *Plugin) pickDownSince(st *sm.ServiceStatus) time.Time {
-	// Prefer systemd timestamps over "first seen down".
 	if st == nil {
 		return time.Time{}
 	}
@@ -160,21 +202,14 @@ func (p *Plugin) pickDownSince(st *sm.ServiceStatus) time.Time {
 
 func (p *Plugin) autoRecoverTick(
 	ctx context.Context,
-	minDown time.Duration,
-	restartTimeout time.Duration,
-	backoffBase time.Duration,
-	backoffMax time.Duration,
-	alertStreak int,
-	alertEvery time.Duration,
+	mgr *sm.ServiceManager,
+	units []string,
+	ap autoParams,
+	opTO time.Duration,
 ) error {
-	mgr := p.mgr
-	if mgr == nil {
+	if mgr == nil || len(units) == 0 {
 		return nil
 	}
-
-	p.mu.RLock()
-	units := append([]string(nil), p.cfg.AllowUnits...)
-	p.mu.RUnlock()
 
 	now := time.Now()
 	rng := rand.New(rand.NewSource(now.UnixNano()))
@@ -183,14 +218,22 @@ func (p *Plugin) autoRecoverTick(
 		// state snapshot / init
 		p.autoMu.Lock()
 		us := p.ensureUnitStateLocked(u)
-		missingWarned := p.missingWarned[u]
+		missingWarned := p.missingWarn[u]
 		p.autoMu.Unlock()
 
 		if us.Missing {
 			continue
 		}
 
-		st, err := mgr.GetStatusContext(ctx, u)
+		stCtx := ctx
+		var cancel context.CancelFunc
+		if opTO > 0 {
+			stCtx, cancel = context.WithTimeout(ctx, opTO)
+		}
+		st, err := mgr.GetStatusContext(stCtx, u)
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil || st == nil {
 			continue
 		}
@@ -199,11 +242,11 @@ func (p *Plugin) autoRecoverTick(
 			p.autoMu.Lock()
 			us.Missing = true
 			if !missingWarned {
-				p.missingWarned[u] = true
+				p.missingWarn[u] = true
 			}
 			p.autoMu.Unlock()
 			if !missingWarned {
-				p.log.Warn("auto-recover skipping missing unit", slog.String("unit", u))
+				p.Log.Warn("auto-recover skipping missing unit", "unit", u)
 			}
 			continue
 		}
@@ -221,11 +264,10 @@ func (p *Plugin) autoRecoverTick(
 
 		ds := p.pickDownSince(st)
 		if ds.IsZero() {
-			// fallback to wall clock if systemd didn't give timestamps
 			ds = now
 		}
 		downFor := now.Sub(ds)
-		if downFor < minDown {
+		if downFor < ap.minDown {
 			continue
 		}
 
@@ -237,15 +279,15 @@ func (p *Plugin) autoRecoverTick(
 		}
 
 		// attempt restart with timeout
-		opCtx, cancel := context.WithTimeout(ctx, restartTimeout)
+		opCtx, cancel := context.WithTimeout(ctx, ap.restartTimeout)
 		rerr := mgr.RestartContext(opCtx, u)
 		cancel()
 
 		if rerr == nil {
-			p.log.Info("auto-recover restart ok",
-				slog.String("unit", u),
-				slog.String("state", st.Active),
-				slog.Duration("down_for", downFor),
+			p.Log.Info("auto-recover restart ok",
+				"unit", u,
+				"state", st.Active,
+				"down_for", downFor,
 			)
 			p.autoMu.Lock()
 			us.FailStreak = 0
@@ -261,37 +303,37 @@ func (p *Plugin) autoRecoverTick(
 		us.FailStreak++
 		us.LastErr = rerr.Error()
 
-		backoff := backoffBase
+		backoff := ap.backoffBase
 		if us.FailStreak > 1 {
 			shift := us.FailStreak - 1
 			if shift > 30 {
 				shift = 30
 			}
-			backoff = backoffBase * time.Duration(1<<shift)
+			backoff = ap.backoffBase * time.Duration(1<<shift)
 		}
-		if backoff > backoffMax {
-			backoff = backoffMax
+		if backoff > ap.backoffMax {
+			backoff = ap.backoffMax
 		}
 
 		jitter := 0.7 + rng.Float64()*0.6 // 0.7..1.3
 		next := now.Add(time.Duration(float64(backoff) * jitter))
 		us.NextTry = next
 
-		shouldAlert := alertStreak > 0 && us.FailStreak >= alertStreak && (us.LastAlert.IsZero() || now.Sub(us.LastAlert) >= alertEvery)
+		shouldAlert := ap.alertStreak > 0 && us.FailStreak >= ap.alertStreak && (us.LastAlert.IsZero() || now.Sub(us.LastAlert) >= ap.alertEvery)
 		if shouldAlert {
 			us.LastAlert = now
 		}
 		failStreak := us.FailStreak
 		p.autoMu.Unlock()
 
-		p.log.Warn("auto-recover restart failed",
-			slog.String("unit", u),
-			slog.String("state", st.Active),
-			slog.Int("streak", failStreak),
-			slog.Duration("down_for", downFor),
-			slog.Duration("backoff", backoff),
-			slog.Time("next_try", next),
-			slog.String("err", rerr.Error()),
+		p.Log.Warn("auto-recover restart failed",
+			"unit", u,
+			"state", st.Active,
+			"streak", failStreak,
+			"down_for", downFor,
+			"backoff", backoff,
+			"next_try", next,
+			"err", rerr,
 		)
 
 		if shouldAlert {
@@ -303,43 +345,22 @@ func (p *Plugin) autoRecoverTick(
 }
 
 func (p *Plugin) notifyAutoRecoverFailure(ctx context.Context, unit string, st *sm.ServiceStatus, err error, streak int, downFor time.Duration, next time.Time) {
-	n := p.deps.Services.Notifier
-	if n == nil {
-		return
-	}
-
-	target := kit.ChatTarget{}
-	// Prefer group_log (if configured), else first owner.
-	group := strings.TrimSpace(p.deps.Config.Get().Telegram.GroupLog)
-	if group != "" {
-		if id, perr := strconv.ParseInt(group, 10, 64); perr == nil {
-			target.ChatID = id
-			// reuse logging thread if set
-			target.ThreadID = p.deps.Config.Get().Logging.Telegram.ThreadID
-		}
-	}
-	if target.ChatID == 0 && len(p.deps.OwnerUserID) > 0 {
-		target.ChatID = p.deps.OwnerUserID[0]
-	}
-
-	if target.ChatID == 0 {
-		return
-	}
-
 	state := ""
 	if st != nil {
 		state = st.Active + "/" + st.SubState
 	}
-	msg := fmt.Sprintf("systemd auto-recover: restart failed\n- unit=%s\n- state=%s\n- streak=%d\n- down_for=%s\n- next_try=%s\n- err=%v",
-		unit, state, streak, downFor, next.Format(time.RFC3339), err,
+	msg := fmt.Sprintf(
+		"systemd auto-recover: restart failed\n- unit=%s\n- state=%s\n- streak=%d\n- down_for=%s\n- next_try=%s\n- err=%v",
+		unit,
+		state,
+		streak,
+		downFor,
+		next.Format(time.RFC3339),
+		err,
 	)
-	_ = n.Notify(ctx, kit.Notification{
-		Priority: 9,
-		Target:   target,
-		Text:     msg,
-		Options:  &kit.SendOptions{DisablePreview: true},
-	})
+	_ = p.Notify().Error(msg)
 }
+
 func mustDur(s string, def time.Duration) time.Duration {
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {

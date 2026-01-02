@@ -408,7 +408,7 @@ func (pm *PluginManager) refreshRegistryLocked(cfg *Config) {
 		if !ok || !raw.Enabled {
 			continue
 		}
-		pto, has := pluginTimeout(cfg, name)
+		pto, has := pluginCommandTimeout(cfg, name)
 
 		for _, c := range p.Commands() {
 			c.PluginName = name
@@ -433,19 +433,68 @@ func (pm *PluginManager) refreshRegistryLocked(cfg *Config) {
 	pm.cmdm.SetRegistry(cmds, cbs)
 }
 
-func pluginTimeout(cfg *Config, plugin string) (time.Duration, bool) {
+func pluginCommandTimeout(cfg *Config, plugin string) (time.Duration, bool) {
 	raw, ok := cfg.Plugins[plugin]
-	if !ok {
+	if !ok || len(raw.Config) == 0 {
 		return 0, false
 	}
-	if raw.Timeout == "" {
+	// Standard schema: plugin.config.timeouts.command
+	type wrap struct {
+		Timeouts struct {
+			Command string `json:"command"`
+		} `json:"timeouts"`
+	}
+	var w wrap
+	if err := json.Unmarshal(raw.Config, &w); err != nil {
 		return 0, false
 	}
-	d := mustDuration(raw.Timeout, 0)
+	if w.Timeouts.Command == "" {
+		return 0, false
+	}
+	d := mustDuration(w.Timeouts.Command, 0)
 	if d <= 0 {
 		return 0, false
 	}
 	return d, true
+}
+
+func validateStandardTimeouts(plugin string, raw json.RawMessage) error {
+	// Only validate if "timeouts" is present; this keeps legacy plugins flexible.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil
+	}
+	b, ok := top["timeouts"]
+	if !ok || len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	var tm map[string]json.RawMessage
+	if err := json.Unmarshal(b, &tm); err != nil {
+		return fmt.Errorf("plugin %s: timeouts must be an object", plugin)
+	}
+	for k, v := range tm {
+		switch k {
+		case "command", "task", "operation":
+			// ok
+		case "job":
+			return fmt.Errorf("plugin %s: timeouts.job is no longer supported; use timeouts.task", plugin)
+		case "request":
+			return fmt.Errorf("plugin %s: timeouts.request is no longer supported; use timeouts.operation", plugin)
+		default:
+			return fmt.Errorf("plugin %s: unknown timeouts field %q (supported: command, task, operation)", plugin, k)
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			return fmt.Errorf("plugin %s: invalid timeouts.%s: %w", plugin, k, err)
+		}
+		if s == "" {
+			continue
+		}
+		if _, err := time.ParseDuration(s); err != nil {
+			return fmt.Errorf("plugin %s: invalid timeouts.%s: %w", plugin, k, err)
+		}
+	}
+	return nil
 }
 
 // ValidateConfig performs per-plugin config validation BEFORE committing/applying a new config.
@@ -461,11 +510,11 @@ func (pm *PluginManager) ValidateConfig(ctx context.Context, cfg *Config) error 
 	for name, p := range pm.reg {
 		raw, ok := cfg.Plugins[name]
 		enabled := ok && raw.Enabled
-		// validate timeout string if set
-		if ok && raw.Timeout != "" {
-			if _, err := time.ParseDuration(raw.Timeout); err != nil {
+		// validate standardized plugin.config.timeouts (if present)
+		if ok && len(raw.Config) > 0 {
+			if err := validateStandardTimeouts(name, raw.Config); err != nil {
 				pm.mu.Unlock()
-				return fmt.Errorf("plugin %s: invalid timeout: %w", name, err)
+				return err
 			}
 		}
 		ops = append(ops, struct {

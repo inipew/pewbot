@@ -141,8 +141,8 @@ func (s *Service) AddOnce(name string, at time.Time, timeout time.Duration, job 
 	}
 	runAt := at.In(loc)
 	resolved := timeout
-	if resolved <= 0 && cfg.DefaultTimeoutMS > 0 {
-		resolved = time.Duration(cfg.DefaultTimeoutMS) * time.Millisecond
+	if resolved <= 0 && cfg.DefaultTimeout > 0 {
+		resolved = cfg.DefaultTimeout
 	}
 
 	s.tmu.Lock()
@@ -355,8 +355,8 @@ func (s *Service) resolveTimeout(t time.Duration) time.Duration {
 	if t > 0 {
 		return t
 	}
-	if s.cfg.DefaultTimeoutMS > 0 {
-		return time.Duration(s.cfg.DefaultTimeoutMS) * time.Millisecond
+	if s.cfg.DefaultTimeout > 0 {
+		return s.cfg.DefaultTimeout
 	}
 	return 0
 }

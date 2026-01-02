@@ -11,12 +11,12 @@ import (
 
 // Config controls the scheduler service.
 type Config struct {
-	Enabled          bool
-	Workers          int
-	DefaultTimeoutMS int
-	HistorySize      int
-	Timezone         string // IANA TZ, e.g. "Asia/Jakarta"
-	RetryMax         int    // max retries per task (default 3)
+	Enabled        bool
+	Workers        int
+	DefaultTimeout time.Duration
+	HistorySize    int
+	Timezone       string // IANA TZ, e.g. "Asia/Jakarta"
+	RetryMax       int    // max retries per task (default 3)
 }
 
 type OverlapPolicy int

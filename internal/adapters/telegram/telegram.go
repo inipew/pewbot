@@ -43,13 +43,13 @@ func New(cfg Config, log *slog.Logger) (*Adapter, error) {
 	if strings.TrimSpace(cfg.Token) == "" {
 		return nil, errors.New("telegram token is empty")
 	}
-	timeout := time.Duration(cfg.PollTimeoutSec)
+	timeout := cfg.PollTimeout
 	if timeout <= 0 {
-		timeout = 10
+		timeout = 10 * time.Second
 	}
 	b, err := tele.NewBot(tele.Settings{
 		Token:  cfg.Token,
-		Poller: &tele.LongPoller{Timeout: timeout * time.Second},
+		Poller: &tele.LongPoller{Timeout: timeout},
 	})
 	if err != nil {
 		return nil, err

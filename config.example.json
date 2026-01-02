@@ -5,7 +5,7 @@
       123456789
     ],
     "group_log": "123456789",
-    "poll_timeout_sec": 10
+    "poll_timeout": "10s"
   },
   "logging": {
     "level": "INFO",
@@ -24,7 +24,7 @@
   "scheduler": {
     "enabled": true,
     "workers": 4,
-    "default_timeout_ms": 10000,
+    "default_timeout": "10s",
     "history_size": 200,
     "timezone": "Asia/Jakarta"
   },
@@ -37,9 +37,11 @@
   "plugins": {
     "echo": {
       "enabled": true,
-      "timeout": "25s",
       "config": {
-        "prefix": "echo: "
+        "prefix": "echo: ",
+        "timeouts": {
+          "command": "25s"
+        }
       }
     },
     "system": {
@@ -47,7 +49,6 @@
     },
     "systemd": {
       "enabled": true,
-      "timeout": "15s",
       "config": {
         "prefix": "svc: ",
         "allow_units": [
@@ -55,10 +56,23 @@
           "caddy",
           "dnscrypt-proxy"
         ],
-        "auto_recover": {
+        "scheduler": {
           "enabled": false,
-          "interval": "30s",
-          "min_down": "3s"
+          "task_name": "auto_recover",
+          "schedule": "30s"
+        },
+        "timeouts": {
+          "command": "15s",
+          "task": "2m",
+          "operation": "2s"
+        },
+        "auto_recover": {
+          "min_down": "3s",
+          "backoff_base": "5s",
+          "backoff_max": "5m",
+          "restart_timeout": "15s",
+          "fail_alert_streak": 3,
+          "alert_interval": "10m"
         }
       }
     },
@@ -66,10 +80,18 @@
       "enabled": false,
       "config": {
         "prefix": "speedtest: ",
-        "auto_speedtest": {
+        "scheduler": {
+          "enabled": false,
+          "task_name": "auto_speedtest",
           "schedule": "*/30 * * * *"
         },
-        "history_file": "speedtest_history.json"
+        "timeouts": {
+          "command": "2m",
+          "task": "2m",
+          "operation": "60s"
+        },
+        "history_file": "speedtest_history.json",
+        "server_count": 3
       }
     }
   }

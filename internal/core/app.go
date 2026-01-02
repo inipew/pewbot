@@ -47,10 +47,13 @@ func NewApp(cfgPath string) (*App, error) {
 	// Adapter config mapping
 	bootLog := slog.New(logging.NewPrettyHandler(logging.Stdout(), slog.LevelInfo)).With(slog.String("comp", "telegram"))
 
-	// Adapter config mapping
+	pollTimeout, err := parseDurationOrDefault("telegram.poll_timeout", cfg.Telegram.PollTimeout, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
 	ad, err := telegram.New(telegram.Config{
-		Token:          cfg.Telegram.Token,
-		PollTimeoutSec: cfg.Telegram.PollTimeoutSec,
+		Token:       cfg.Telegram.Token,
+		PollTimeout: pollTimeout,
 	}, bootLog)
 	if err != nil {
 		return nil, err
@@ -81,13 +84,18 @@ func NewApp(cfgPath string) (*App, error) {
 	}
 
 	// Services mapping
+	defaultTimeout, err := parseDurationField("scheduler.default_timeout", cfg.Scheduler.DefaultTimeout)
+	if err != nil {
+		return nil, err
+	}
+
 	schedSvc := scheduler.New(scheduler.Config{
-		Enabled:          cfg.Scheduler.Enabled,
-		Workers:          cfg.Scheduler.Workers,
-		DefaultTimeoutMS: cfg.Scheduler.DefaultTimeoutMS,
-		HistorySize:      cfg.Scheduler.HistorySize,
-		Timezone:         cfg.Scheduler.Timezone,
-		RetryMax:         cfg.Scheduler.RetryMax,
+		Enabled:        cfg.Scheduler.Enabled,
+		Workers:        cfg.Scheduler.Workers,
+		DefaultTimeout: defaultTimeout,
+		HistorySize:    cfg.Scheduler.HistorySize,
+		Timezone:       cfg.Scheduler.Timezone,
+		RetryMax:       cfg.Scheduler.RetryMax,
 	}, log.With(slog.String("comp", "scheduler")))
 
 	bcastSvc := broadcast.New(broadcast.Config{
@@ -159,6 +167,12 @@ func (a *App) Start(ctx context.Context) error {
 		a.cfgm.SetLogger(a.log.With(slog.String("comp", "config")))
 		a.cfgm.SetValidator(func(c context.Context, cfg *Config) error {
 			// global validation
+			if _, err := parseDurationField("telegram.poll_timeout", cfg.Telegram.PollTimeout); err != nil {
+				return err
+			}
+			if _, err := parseDurationField("scheduler.default_timeout", cfg.Scheduler.DefaultTimeout); err != nil {
+				return err
+			}
 			if cfg.Scheduler.Workers < 0 {
 				return fmt.Errorf("scheduler.workers must be >= 0")
 			}
@@ -264,13 +278,18 @@ func (a *App) Start(ctx context.Context) error {
 				// apply scheduler/broadcast updates (live)
 				prevSchedEnabled := a.sched.Enabled()
 				prevBcastEnabled := a.bcast.Enabled()
+				newDefaultTimeout, err := parseDurationField("scheduler.default_timeout", newCfg.Scheduler.DefaultTimeout)
+				if err != nil {
+					a.log.Warn("invalid scheduler.default_timeout; using 0", slog.Any("err", err))
+					newDefaultTimeout = 0
+				}
 				a.sched.Apply(scheduler.Config{
-					Enabled:          newCfg.Scheduler.Enabled,
-					Workers:          newCfg.Scheduler.Workers,
-					DefaultTimeoutMS: newCfg.Scheduler.DefaultTimeoutMS,
-					HistorySize:      newCfg.Scheduler.HistorySize,
-					Timezone:         newCfg.Scheduler.Timezone,
-					RetryMax:         newCfg.Scheduler.RetryMax,
+					Enabled:        newCfg.Scheduler.Enabled,
+					Workers:        newCfg.Scheduler.Workers,
+					DefaultTimeout: newDefaultTimeout,
+					HistorySize:    newCfg.Scheduler.HistorySize,
+					Timezone:       newCfg.Scheduler.Timezone,
+					RetryMax:       newCfg.Scheduler.RetryMax,
 				})
 				a.bcast.Apply(broadcast.Config{
 					Enabled:    newCfg.Broadcaster.Enabled,

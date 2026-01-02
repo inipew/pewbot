@@ -59,6 +59,15 @@ func (p *Plugin) OnConfigChange(ctx context.Context, raw json.RawMessage) error 
 	}
 
 	var c Config
+	// Fail fast on removed legacy fields to avoid silent misconfig.
+	// (Old schema: timeout_seconds, timeouts.job/request)
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err == nil {
+		if _, ok := probe["timeout_seconds"]; ok {
+			return fmt.Errorf("speedtest.timeout_seconds is no longer supported; use speedtest.timeouts.operation")
+		}
+	}
+
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return fmt.Errorf("unmarshal config: %w", err)
 	}
@@ -67,28 +76,66 @@ func (p *Plugin) OnConfigChange(ctx context.Context, raw json.RawMessage) error 
 	if c.ServerCount == 0 {
 		c.ServerCount = 3
 	}
-	if c.Timeout == 0 {
-		c.Timeout = 30
+
+	// Validate optional standardized timeouts.
+	if err := c.Timeouts.Validate("speedtest.timeouts"); err != nil {
+		return err
 	}
+
+	// timeouts.operation bounds a single speedtest run.
+	c.operationTimeout = c.Timeouts.OperationOr(30 * time.Second)
+
+	// timeouts.task controls scheduler task timeout.
+	c.taskTimeout = c.Timeouts.TaskOr(60 * time.Second)
 
 	p.mu.Lock()
 	p.cfg = c
 	p.mu.Unlock()
 
-	// Setup / remove auto speedtest schedule.
-	if c.AutoSpeed.Schedule == "" {
-		if p.Schedule() != nil {
-			p.Schedule().Remove("auto")
+	// Setup / remove auto speedtest schedule (new unified schema).
+	sc := c.Scheduler
+	if sc.TaskName == "" {
+		sc.TaskName = "auto_speedtest"
+	}
+	if sc.Enabled && sc.Schedule == "" {
+		return fmt.Errorf("speedtest.scheduler.schedule is required when scheduler.enabled=true")
+	}
+	// Validate schedule early to avoid removing a working schedule on a bad config.
+	if sc.Enabled {
+		if _, err := core.ParseSchedule(sc.Schedule); err != nil {
+			return fmt.Errorf("invalid speedtest.scheduler.schedule: %w", err)
 		}
+	}
+
+	// Reconcile auto schedule.
+	oldTask := func() string {
+		p.mu.RLock()
+		defer p.mu.RUnlock()
+		return p.autoTask
+	}()
+	if p.Schedule() != nil {
+		if oldTask != "" && oldTask != sc.TaskName {
+			p.Schedule().Remove(oldTask)
+		}
+		if !sc.Enabled || sc.Schedule == "" {
+			if oldTask != "" {
+				p.Schedule().Remove(oldTask)
+			}
+			p.mu.Lock()
+			p.autoTask = ""
+			p.mu.Unlock()
+			return nil
+		}
+	} else {
+		// scheduler service not available; keep config but don't fail reload
+		p.Log.Warn("scheduler not available; auto speedtest not scheduled")
 		return nil
 	}
-	if p.Schedule() == nil {
-		return nil
-	}
+
 	// Use helper API: schedule can be cron (crontab.guru), HH:MM, or a Go duration.
-	// Namespaced task name becomes "speedtest:auto".
-	return p.Schedule().Spec("auto", c.AutoSpeed.Schedule).
-		Timeout(60 * time.Second).
+	// Namespaced task name becomes "speedtest:<task_name>".
+	err := p.Schedule().Spec(sc.TaskName, sc.Schedule).
+		Timeout(c.taskTimeout).
 		SkipIfRunning().
 		Do(func(ctx context.Context) error {
 			result, msg, err := p.runSpeedtest(ctx)
@@ -104,5 +151,10 @@ func (p *Plugin) OnConfigChange(ctx context.Context, raw json.RawMessage) error 
 			_ = p.Notify().Info(msg)
 			return nil
 		})
-
+	if err == nil {
+		p.mu.Lock()
+		p.autoTask = sc.TaskName
+		p.mu.Unlock()
+	}
+	return err
 }

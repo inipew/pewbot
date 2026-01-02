@@ -1,6 +1,8 @@
 package telegram
 
+import "time"
+
 type Config struct {
-	Token          string
-	PollTimeoutSec int
+	Token       string
+	PollTimeout time.Duration
 }

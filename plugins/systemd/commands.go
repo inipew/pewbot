@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"pewbot/internal/core"
 	"pewbot/internal/kit"
@@ -35,6 +36,14 @@ func (p *Plugin) Commands() []core.Command {
 			Aliases:     []string{"systemd_st"},
 			Access:      core.AccessOwnerOnly,
 			Handle:      p.cmdStatus,
+		},
+		{
+			Route:       "systemd auto",
+			Description: "show auto-recover status/config",
+			Usage:       "/systemd auto",
+			Aliases:     []string{"systemd_autorecover", "systemd_auto"},
+			Access:      core.AccessOwnerOnly,
+			Handle:      p.cmdAuto,
 		},
 		{
 			Route:       "systemd start",
@@ -101,12 +110,78 @@ func (p *Plugin) Commands() []core.Command {
 	}
 }
 
+func (p *Plugin) cmdAuto(ctx context.Context, req *core.Request) error {
+	cfg := p.cfgSnapshot()
+	mgr := p.mgrSnapshot()
+
+	lines := []string{"auto-recover:"}
+	sc := cfg.Scheduler
+	name := sc.NameOr("auto_recover")
+	lines = append(lines, fmt.Sprintf("- scheduler.enabled: %v", sc.Enabled))
+	lines = append(lines, "- scheduler.task_name: "+name)
+	if sc.Schedule != "" {
+		lines = append(lines, "- scheduler.schedule: "+sc.Schedule)
+	}
+	lines = append(lines, "- min_down: "+cfg.AutoRecover.MinDown)
+	lines = append(lines, "- restart_timeout: "+cfg.AutoRecover.RestartTimeout)
+	lines = append(lines, "- backoff_base: "+cfg.AutoRecover.BackoffBase)
+	lines = append(lines, "- backoff_max: "+cfg.AutoRecover.BackoffMax)
+	lines = append(lines, fmt.Sprintf("- alert_streak: %d", cfg.AutoRecover.FailAlertStreak))
+	lines = append(lines, "- alert_interval: "+cfg.AutoRecover.AlertInterval)
+	if mgr == nil {
+		lines = append(lines, "- manager: unavailable")
+	} else {
+		lines = append(lines, "- manager: ok")
+	}
+	if p.Schedule() == nil {
+		lines = append(lines, "- scheduler: unavailable")
+	} else {
+		lines = append(lines, "- scheduler: ok")
+	}
+
+	// Show next tries for units (best-effort).
+	p.autoMu.Lock()
+	state := make(map[string]unitRecoverState, len(p.recoverState))
+	for k, v := range p.recoverState {
+		if v == nil {
+			continue
+		}
+		state[k] = *v
+	}
+	p.autoMu.Unlock()
+
+	if len(state) > 0 {
+		keys := make([]string, 0, len(state))
+		for k := range state {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		lines = append(lines, "", "state:")
+		now := time.Now()
+		for _, u := range keys {
+			st := state[u]
+			if st.Missing {
+				lines = append(lines, "- "+u+": missing")
+				continue
+			}
+			next := "-"
+			if !st.NextTry.IsZero() {
+				next = st.NextTry.Format(time.RFC3339)
+				if st.NextTry.After(now) {
+					next += " (in " + durShort(st.NextTry.Sub(now)) + ")"
+				}
+			}
+			lines = append(lines, fmt.Sprintf("- %s: streak=%d next_try=%s last_err=%s", u, st.FailStreak, next, st.LastErr))
+		}
+	}
+
+	_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+strings.Join(lines, "\n"), &kit.SendOptions{DisablePreview: true})
+	return nil
+}
+
 func (p *Plugin) cmdHelp(ctx context.Context, req *core.Request) error {
-	p.mu.RLock()
-	cfg := p.cfg
-	units := append([]string(nil), p.cfg.AllowUnits...)
-	p.mu.RUnlock()
-	sort.Strings(units)
+	cfg := p.cfgSnapshot()
+	units := append([]string(nil), cfg.AllowUnits...)
 
 	lines := []string{
 		"systemd help:",
@@ -119,6 +194,7 @@ func (p *Plugin) cmdHelp(ctx context.Context, req *core.Request) error {
 		"/systemd disable <unit>",
 		"/systemd failed",
 		"/systemd inactive",
+		"/systemd auto",
 		"allowed: " + strings.Join(units, ", "),
 	}
 	_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+strings.Join(lines, "\n"), nil)
@@ -126,10 +202,8 @@ func (p *Plugin) cmdHelp(ctx context.Context, req *core.Request) error {
 }
 
 func (p *Plugin) cmdList(ctx context.Context, req *core.Request) error {
-	mgr := p.mgr
-	p.mu.RLock()
-	cfg := p.cfg
-	p.mu.RUnlock()
+	mgr := p.mgrSnapshot()
+	cfg := p.cfgSnapshot()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -141,15 +215,14 @@ func (p *Plugin) cmdList(ctx context.Context, req *core.Request) error {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"no managed units configured", nil)
 		return nil
 	}
+	sort.Strings(units)
 	_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"managed units:\n- "+strings.Join(units, "\n- "), nil)
 	return nil
 }
 
 func (p *Plugin) cmdFailed(ctx context.Context, req *core.Request) error {
-	mgr := p.mgr
-	p.mu.RLock()
-	cfg := p.cfg
-	p.mu.RUnlock()
+	mgr := p.mgrSnapshot()
+	cfg := p.cfgSnapshot()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -170,10 +243,8 @@ func (p *Plugin) cmdFailed(ctx context.Context, req *core.Request) error {
 }
 
 func (p *Plugin) cmdInactive(ctx context.Context, req *core.Request) error {
-	mgr := p.mgr
-	p.mu.RLock()
-	cfg := p.cfg
-	p.mu.RUnlock()
+	mgr := p.mgrSnapshot()
+	cfg := p.cfgSnapshot()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -194,10 +265,8 @@ func (p *Plugin) cmdInactive(ctx context.Context, req *core.Request) error {
 }
 
 func (p *Plugin) cmdOperate(ctx context.Context, req *core.Request, action string, args []string) error {
-	mgr := p.mgr
-	p.mu.RLock()
-	cfg := p.cfg
-	p.mu.RUnlock()
+	mgr := p.mgrSnapshot()
+	cfg := p.cfgSnapshot()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -278,10 +347,8 @@ func (p *Plugin) cmdOperate(ctx context.Context, req *core.Request, action strin
 }
 
 func (p *Plugin) cmdStatus(ctx context.Context, req *core.Request) error {
-	mgr := p.mgr
-	p.mu.RLock()
-	cfg := p.cfg
-	p.mu.RUnlock()
+	mgr := p.mgrSnapshot()
+	cfg := p.cfgSnapshot()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -363,16 +430,17 @@ func (p *Plugin) unitsFromArgs(args []string) ([]string, error) {
 	if len(units) == 0 {
 		return nil, errors.New("missing unit name")
 	}
-	return units, nil
+	// accept "foo.service" and normalize
+	return normalizeUnits(units), nil
 }
 
 func (p *Plugin) allowed(u string) bool {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-	for _, x := range p.cfg.AllowUnits {
-		if x == u {
-			return true
-		}
+	set := p.cfg.allowSet
+	p.mu.RUnlock()
+	if set == nil {
+		return false
 	}
-	return false
+	_, ok := set[u]
+	return ok
 }
