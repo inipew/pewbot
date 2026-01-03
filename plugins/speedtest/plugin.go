@@ -57,8 +57,21 @@ func (p *Plugin) OnConfigChange(ctx context.Context, raw json.RawMessage) error 
 	}
 
 	// Set defaults
-	if c.ServerCount == 0 {
-		c.ServerCount = 3
+	if c.ServerCount <= 0 {
+		c.ServerCount = 5
+	}
+	if c.FullTestServers <= 0 {
+		c.FullTestServers = 1
+	}
+	if c.FullTestServers > c.ServerCount {
+		c.FullTestServers = c.ServerCount
+	}
+	// Default saving mode to true unless explicitly set.
+	if _, ok := probe["saving_mode"]; !ok {
+		c.SavingMode = true
+	}
+	if c.MaxConnections <= 0 {
+		c.MaxConnections = 4
 	}
 
 	// Validate optional standardized timeouts.

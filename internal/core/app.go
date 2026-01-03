@@ -12,6 +12,7 @@ import (
 	"pewbot/internal/kit"
 	"pewbot/internal/services/logging"
 	"pewbot/internal/services/notify"
+	"pewbot/internal/services/pprof"
 	"pewbot/internal/services/scheduler"
 )
 
@@ -28,6 +29,7 @@ type App struct {
 
 	sched *scheduler.Service
 	notif *notify.Service
+	pprof *pprof.Service
 
 	cmdm *CommandManager
 	pm   *PluginManager
@@ -98,6 +100,13 @@ func NewApp(cfgPath string) (*App, error) {
 
 	notifSvc := notify.New(ad, log.With(slog.String("comp", "notifier")))
 
+	// pprof service mapping (optional)
+	pprofCfg, err := mapPprofConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	pprofSvc := pprof.New(pprofCfg, log.With(slog.String("comp", "pprof")))
+
 	serv := &Services{
 		Scheduler: schedSvc,
 		Notifier:  notifSvc,
@@ -123,6 +132,7 @@ func NewApp(cfgPath string) (*App, error) {
 		adapter: ad,
 		sched:   schedSvc,
 		notif:   notifSvc,
+		pprof:   pprofSvc,
 		cmdm:    cmdm,
 		pm:      pm,
 		updates: make(chan kit.Update, 256),
@@ -174,6 +184,10 @@ func (a *App) Start(ctx context.Context) error {
 					return fmt.Errorf("scheduler.timezone: invalid %q: %w", tz, err)
 				}
 			}
+			// pprof validation (safe even when disabled)
+			if _, err := mapPprofConfig(cfg); err != nil {
+				return err
+			}
 			// per-plugin validation
 			if a.pm != nil {
 				return a.pm.ValidateConfig(c, cfg)
@@ -188,6 +202,9 @@ func (a *App) Start(ctx context.Context) error {
 
 	if a.sched.Enabled() {
 		a.sched.Start(a.sup.Context())
+	}
+	if a.pprof != nil && a.pprof.Enabled() {
+		a.pprof.Start(a.sup.Context())
 	}
 
 	if err := a.pm.StartAll(a.sup.Context()); err != nil {
@@ -292,6 +309,16 @@ func (a *App) Start(ctx context.Context) error {
 					a.sched.Start(c)
 				}
 
+				// apply pprof updates (live)
+				if a.pprof != nil {
+					ppc, err := mapPprofConfig(newCfg)
+					if err != nil {
+						a.log.Warn("invalid pprof config; keeping previous", slog.Any("err", err))
+					} else {
+						a.pprof.Reconfigure(c, ppc)
+					}
+				}
+
 				// apply plugin enable/disable + per-plugin config
 				a.pm.OnConfigUpdate(c, newCfg)
 
@@ -393,6 +420,12 @@ func (a *App) Stop(ctx context.Context, reason StopReason) error {
 
 	// Stop services (order: scheduler/notifier/adapter)
 	step("scheduler", 2*time.Second, func(c context.Context) error { a.sched.Stop(c); return nil })
+	step("pprof", 1*time.Second, func(c context.Context) error {
+		if a.pprof != nil {
+			a.pprof.Stop(c)
+		}
+		return nil
+	})
 	step("notifier", 1*time.Second, func(c context.Context) error { a.notif.Stop(c); return nil })
 	step("adapter", 2*time.Second, func(c context.Context) error { return a.adapter.Stop(c) })
 

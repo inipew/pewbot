@@ -77,6 +77,10 @@ type ServiceManager struct {
 	// on every status check (auto-recover can call status frequently).
 	enabledCache map[string]enabledCacheEntry
 	enabledTTL   time.Duration
+
+	enabledMax   int
+	enabledSweep uint64
+	enabledOps   uint64
 }
 
 type enabledCacheEntry struct {
@@ -85,6 +89,8 @@ type enabledCacheEntry struct {
 }
 
 const defaultEnabledCacheTTL = 5 * time.Minute
+const defaultEnabledCacheMax = 512
+const defaultEnabledCacheSweepEvery = 64
 
 //
 // Construction & lifecycle
@@ -102,6 +108,8 @@ func NewServiceManager(services []string) (*ServiceManager, error) {
 		services:     append([]string(nil), services...), // defensive copy
 		enabledCache: map[string]enabledCacheEntry{},
 		enabledTTL:   defaultEnabledCacheTTL,
+		enabledMax:   defaultEnabledCacheMax,
+		enabledSweep: defaultEnabledCacheSweepEvery,
 	}, nil
 }
 
@@ -117,7 +125,7 @@ func (sm *ServiceManager) SetEnabledCacheTTL(ttl time.Duration) {
 		ttl = defaultEnabledCacheTTL
 	}
 	sm.enabledTTL = ttl
-	// Clear entries so callers observe the new policy immediately.
+	sm.enabledOps = 0
 	if sm.enabledCache != nil {
 		for k := range sm.enabledCache {
 			delete(sm.enabledCache, k)
@@ -129,10 +137,60 @@ func (sm *ServiceManager) SetEnabledCacheTTL(ttl time.Duration) {
 func (sm *ServiceManager) ClearEnabledCache() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	sm.enabledOps = 0
 	if sm.enabledCache != nil {
 		for k := range sm.enabledCache {
 			delete(sm.enabledCache, k)
 		}
+	}
+}
+
+// SetEnabledCacheMax updates the maximum number of cached IsEnabled entries.
+//
+// Semantics:
+//   - max <= 0 : use default max
+func (sm *ServiceManager) SetEnabledCacheMax(max int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if max <= 0 {
+		max = defaultEnabledCacheMax
+	}
+	sm.enabledMax = max
+	if sm.enabledCache != nil {
+		sm.pruneEnabledCacheLocked(time.Now())
+	}
+}
+
+func (sm *ServiceManager) pruneEnabledCacheLocked(now time.Time) {
+	if sm.enabledCache == nil {
+		return
+	}
+	max := sm.enabledMax
+	if max <= 0 {
+		max = defaultEnabledCacheMax
+	}
+	// 1) Drop expired entries.
+	for k, ent := range sm.enabledCache {
+		if !ent.expires.IsZero() && now.After(ent.expires) {
+			delete(sm.enabledCache, k)
+		}
+	}
+	if max <= 0 || len(sm.enabledCache) <= max {
+		return
+	}
+	// 2) Still too large: drop the oldest (earliest expiry) entries.
+	type kv struct {
+		k string
+		e time.Time
+	}
+	items := make([]kv, 0, len(sm.enabledCache))
+	for k, ent := range sm.enabledCache {
+		items = append(items, kv{k: k, e: ent.expires})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].e.Before(items[j].e) })
+	excess := len(sm.enabledCache) - max
+	for i := 0; i < excess && i < len(items); i++ {
+		delete(sm.enabledCache, items[i].k)
 	}
 }
 
@@ -466,7 +524,17 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 		if sm.enabledCache == nil {
 			sm.enabledCache = map[string]enabledCacheEntry{}
 		}
+		if sm.enabledMax <= 0 {
+			sm.enabledMax = defaultEnabledCacheMax
+		}
+		if sm.enabledSweep == 0 {
+			sm.enabledSweep = defaultEnabledCacheSweepEvery
+		}
 		sm.enabledCache[serviceName] = enabledCacheEntry{enabled: enabled, expires: now.Add(ttl)}
+		sm.enabledOps++
+		if len(sm.enabledCache) > sm.enabledMax || (sm.enabledSweep > 0 && sm.enabledOps%sm.enabledSweep == 0) {
+			sm.pruneEnabledCacheLocked(now)
+		}
 		sm.mu.Unlock()
 	}
 
@@ -712,42 +780,54 @@ func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceSta
 	copy(services, sm.services)
 	sm.mu.RUnlock()
 
-	statuses := make([]ServiceStatus, 0, len(services))
-	var (
-		mu sync.Mutex
-		wg sync.WaitGroup
-	)
+	if len(services) == 0 {
+		return []ServiceStatus{}, nil
+	}
 
-	for _, service := range services {
+	// Use a small worker pool to avoid spawning one goroutine per service,
+	// which can cause transient memory spikes when the managed list is large.
+	workers := 8
+	if workers > len(services) {
+		workers = len(services)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	jobs := make(chan string, workers*2)
+	results := make(chan ServiceStatus, len(services))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		svc := service
-
 		go func() {
 			defer wg.Done()
+			for svc := range jobs {
+				svcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+				st, err := sm.GetStatusFullContext(svcCtx, svc)
+				cancel()
 
-			svcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-			defer cancel()
-
-			status, err := sm.GetStatusFullContext(svcCtx, svc)
-			if err != nil {
-				mu.Lock()
-				statuses = append(statuses, ServiceStatus{
-					Name:      svc,
-					Active:    "unknown",
-					SubState:  "error",
-					LoadState: "not-found",
-				})
-				mu.Unlock()
-				return
+				if err != nil || st == nil {
+					results <- ServiceStatus{Name: svc, Active: "unknown", SubState: "error", LoadState: "not-found"}
+					continue
+				}
+				results <- *st
 			}
-
-			mu.Lock()
-			statuses = append(statuses, *status)
-			mu.Unlock()
 		}()
 	}
 
+	for _, svc := range services {
+		jobs <- svc
+	}
+	close(jobs)
+
 	wg.Wait()
+	close(results)
+
+	statuses := make([]ServiceStatus, 0, len(services))
+	for st := range results {
+		statuses = append(statuses, st)
+	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Name < statuses[j].Name })
 	return statuses, nil
 }

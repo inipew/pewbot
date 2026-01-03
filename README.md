@@ -7,6 +7,7 @@ Modular Telegram bot framework (single operator) dengan:
 - Notifier (multi-channel + priority routes + history)
 - Smart logging (console/file/Telegram sink + rate limit + min-level)
 - Middleware (panic recovery + request logging)
+- Optional pprof HTTP server (diagnostics; configurable + safe-by-default)
 
 ## Quickstart
 
@@ -27,6 +28,19 @@ cp config.example.json config.json
 go mod tidy
 go run ./cmd/bot -config ./config.json
 ```
+
+## pprof (optional)
+
+Aktifkan di config:
+
+- `pprof.enabled`: true/false
+- `pprof.addr`: default `127.0.0.1:6060`
+- `pprof.prefix`: default `/debug/pprof/`
+- `pprof.token`: (opsional) Bearer token. Jika bind non-loopback, token wajib kecuali `allow_insecure=true`.
+
+Contoh akses:
+- `http://127.0.0.1:6060/debug/pprof/`
+- dengan token: kirim `Authorization: Bearer <token>` atau `?token=<token>`
 
 ## Core commands
 - `/help`

@@ -71,6 +71,9 @@ func (sm *ServiceManager) SetEnabledCacheTTL(ttl time.Duration) {}
 // ClearEnabledCache clears cached IsEnabled results (no-op on non-linux).
 func (sm *ServiceManager) ClearEnabledCache() {}
 
+// SetEnabledCacheMax updates the IsEnabled cache max entries (no-op on non-linux).
+func (sm *ServiceManager) SetEnabledCacheMax(max int) {}
+
 func (sm *ServiceManager) Close() error { return nil }
 
 func (sm *ServiceManager) GetManagedServices() []string {

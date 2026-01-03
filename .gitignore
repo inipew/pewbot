@@ -2,3 +2,4 @@ config.json
 *.log
 pewbot*.zip
 pewbot
+pprof*.zip

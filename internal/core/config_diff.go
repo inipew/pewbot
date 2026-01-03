@@ -51,6 +51,28 @@ func SummarizeConfigChange(oldCfg, newCfg *Config) ([]string, []slog.Attr, []str
 		)
 	}
 
+	// Pprof (never log token)
+	if oldCfg.Pprof.Enabled != newCfg.Pprof.Enabled ||
+		strings.TrimSpace(oldCfg.Pprof.Addr) != strings.TrimSpace(newCfg.Pprof.Addr) ||
+		strings.TrimSpace(oldCfg.Pprof.Prefix) != strings.TrimSpace(newCfg.Pprof.Prefix) ||
+		oldCfg.Pprof.AllowInsecure != newCfg.Pprof.AllowInsecure ||
+		strings.TrimSpace(oldCfg.Pprof.ReadTimeout) != strings.TrimSpace(newCfg.Pprof.ReadTimeout) ||
+		strings.TrimSpace(oldCfg.Pprof.WriteTimeout) != strings.TrimSpace(newCfg.Pprof.WriteTimeout) ||
+		strings.TrimSpace(oldCfg.Pprof.IdleTimeout) != strings.TrimSpace(newCfg.Pprof.IdleTimeout) ||
+		oldCfg.Pprof.MutexProfileFraction != newCfg.Pprof.MutexProfileFraction ||
+		oldCfg.Pprof.BlockProfileRate != newCfg.Pprof.BlockProfileRate ||
+		oldCfg.Pprof.MemProfileRate != newCfg.Pprof.MemProfileRate ||
+		(strings.TrimSpace(oldCfg.Pprof.Token) != "") != (strings.TrimSpace(newCfg.Pprof.Token) != "") {
+		changed = append(changed, "pprof")
+		attrs = append(attrs,
+			slog.Bool("pprof.enabled", newCfg.Pprof.Enabled),
+			slog.String("pprof.addr", strings.TrimSpace(newCfg.Pprof.Addr)),
+			slog.String("pprof.prefix", strings.TrimSpace(newCfg.Pprof.Prefix)),
+			slog.Bool("pprof.token_set", strings.TrimSpace(newCfg.Pprof.Token) != ""),
+			slog.Bool("pprof.allow_insecure", newCfg.Pprof.AllowInsecure),
+		)
+	}
+
 	// Scheduler
 	if !reflect.DeepEqual(oldCfg.Scheduler, newCfg.Scheduler) {
 		changed = append(changed, "scheduler")

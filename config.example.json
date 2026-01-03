@@ -21,6 +21,19 @@
       "rate_per_sec": 2
     }
   },
+  "pprof": {
+    "enabled": false,
+    "addr": "127.0.0.1:6060",
+    "prefix": "/debug/pprof/",
+    "token": "",
+    "allow_insecure": false,
+    "read_timeout": "5s",
+    "write_timeout": "0s",
+    "idle_timeout": "120s",
+    "mutex_profile_fraction": 0,
+    "block_profile_rate": 0,
+    "mem_profile_rate": 0
+  },
   "scheduler": {
     "enabled": true,
     "workers": 4,

@@ -15,7 +15,24 @@ type Config struct {
 	Scheduler   pluginkit.SchedulerTaskConfig `json:"scheduler"`
 	Timeouts    pluginkit.TimeoutsConfig      `json:"timeouts,omitempty"`
 	HistoryFile string                        `json:"history_file"`
-	ServerCount int                           `json:"server_count"`
+	// ServerCount is the number of candidate servers to consider.
+	// We will run latency tests on these candidates, then run the full
+	// download/upload test on FullTestServers of the best candidates.
+	ServerCount int `json:"server_count"`
+
+	// FullTestServers controls how many of the lowest-latency servers
+	// will be used for the full download/upload test (sequentially).
+	// Keeping this small (1-2) dramatically reduces peak memory usage.
+	FullTestServers int `json:"full_test_servers"`
+
+	// SavingMode and MaxConnections are passed into speedtest-go UserConfig.
+	// These help reduce peak allocations during download/upload tests.
+	SavingMode     bool `json:"saving_mode"`
+	MaxConnections int  `json:"max_connections"`
+
+	// PostRunGC enables a lightweight GC at the end of a speedtest run.
+	// Prefer fixing retention (client lifetime / Reset) before enabling this.
+	PostRunGC bool `json:"post_run_gc"`
 
 	taskTimeout      time.Duration `json:"-"`
 	operationTimeout time.Duration `json:"-"`
