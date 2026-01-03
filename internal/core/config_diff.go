@@ -84,6 +84,38 @@ func SummarizeConfigChange(oldCfg, newCfg *Config) ([]string, []slog.Attr, []str
 		)
 	}
 
+	// Notifier (async pipeline)
+	// Note: section may be nil (omitted). Treat nil as runtime defaults for a more accurate summary.
+	defN := &NotifierConfig{
+		Enabled:         true,
+		Workers:         2,
+		QueueSize:       512,
+		RatePerSec:      3,
+		RetryMax:        3,
+		RetryBase:       "500ms",
+		RetryMaxDelay:   "10s",
+		DedupWindow:     "1m",
+		DedupMaxEntries: 2000,
+	}
+	oldN := oldCfg.Notifier
+	newN := newCfg.Notifier
+	if oldN == nil {
+		oldN = defN
+	}
+	if newN == nil {
+		newN = defN
+	}
+	if !reflect.DeepEqual(*oldN, *newN) {
+		changed = append(changed, "notifier")
+		attrs = append(attrs,
+			slog.Bool("notifier.enabled", newN.Enabled),
+			slog.Int("notifier.workers", newN.Workers),
+			slog.Int("notifier.queue_size", newN.QueueSize),
+			slog.Int("notifier.rate_per_sec", newN.RatePerSec),
+			slog.Int("notifier.retry_max", newN.RetryMax),
+		)
+	}
+
 	// Plugins (summarize only; details at debug)
 	pluginChanged := diffPlugins(oldCfg.Plugins, newCfg.Plugins)
 	if len(pluginChanged) > 0 {

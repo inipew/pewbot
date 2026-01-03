@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"pewbot/internal/eventbus"
 )
 
 // AddSchedule parses schedule and registers either a cron or interval task.
@@ -311,6 +312,10 @@ func (s *Service) addCronLocked(d *scheduleDef) error {
 			d.state.mu.Unlock()
 			if running {
 				s.log.Debug("schedule skipped (previous run still running)", slog.String("task", d.name))
+				if s.bus != nil {
+					now := time.Now()
+					s.bus.Publish(eventbus.Event{Type: "task.skipped", Time: now, Data: TaskEvent{ID: d.id, Name: d.name, Started: now, Attempts: 0, Error: "overlap_skip"}})
+				}
 				return
 			}
 		}

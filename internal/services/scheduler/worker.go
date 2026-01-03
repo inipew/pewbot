@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"pewbot/internal/eventbus"
 )
 
 func (s *Service) enqueue(t task) {
@@ -52,6 +54,9 @@ func (s *Service) worker(ctx context.Context, stopCh <-chan struct{}, queue <-ch
 
 func (s *Service) execOne(ctx context.Context, stopCh <-chan struct{}, t task) {
 	start := time.Now()
+	if s.bus != nil {
+		s.bus.Publish(eventbus.Event{Type: "task.started", Time: start, Data: TaskEvent{ID: t.id, Name: t.name, Started: start}})
+	}
 
 	// Mark running for overlap control (shared state between cron invocations).
 	if t.state != nil {
@@ -131,12 +136,18 @@ attemptLoop:
 	if err != nil {
 		item.Error = err.Error()
 		s.log.Warn("task failed", slog.String("task", t.name), slog.Any("err", err), slog.Duration("dur", dur), slog.Int("attempts", attempts))
+		if s.bus != nil {
+			s.bus.Publish(eventbus.Event{Type: "task.failed", Time: time.Now(), Data: TaskEvent{ID: t.id, Name: t.name, Started: start, Duration: dur, Attempts: attempts, Error: item.Error}})
+		}
 	} else {
 		// Avoid noisy logs for very frequent tasks: only elevate to INFO when it took noticeable time.
 		if dur >= 750*time.Millisecond {
 			s.log.Info("task completed", slog.String("task", t.name), slog.Duration("dur", dur), slog.Int("attempts", attempts))
 		} else {
 			s.log.Debug("task completed", slog.String("task", t.name), slog.Duration("dur", dur), slog.Int("attempts", attempts))
+		}
+		if s.bus != nil {
+			s.bus.Publish(eventbus.Event{Type: "task.finished", Time: time.Now(), Data: TaskEvent{ID: t.id, Name: t.name, Started: start, Duration: dur, Attempts: attempts}})
 		}
 	}
 

@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"pewbot/internal/eventbus"
 )
 
-func New(cfg Config, log *slog.Logger) *Service {
+func New(cfg Config, log *slog.Logger, bus eventbus.Bus) *Service {
 	return &Service{
 		cfg: cfg,
 		log: log,
+		bus: bus,
 		// SecondOptional allows both 5-field and 6-field (with seconds) cron specs.
 		parser:      cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor),
 		timers:      map[string]*time.Timer{},

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"pewbot/internal/adapters/telegram"
+	"pewbot/internal/eventbus"
 	"pewbot/internal/kit"
 	"pewbot/internal/services/logging"
 	"pewbot/internal/services/notify"
@@ -24,6 +25,7 @@ type App struct {
 
 	log  *slog.Logger
 	logs *logging.Service
+	bus  eventbus.Bus
 
 	adapter kit.Adapter
 
@@ -83,6 +85,8 @@ func NewApp(cfgPath string) (*App, error) {
 		}
 	}
 
+	bus := eventbus.New()
+
 	// Services mapping
 	defaultTimeout, err := parseDurationField("scheduler.default_timeout", cfg.Scheduler.DefaultTimeout)
 	if err != nil {
@@ -96,9 +100,13 @@ func NewApp(cfgPath string) (*App, error) {
 		HistorySize:    cfg.Scheduler.HistorySize,
 		Timezone:       cfg.Scheduler.Timezone,
 		RetryMax:       cfg.Scheduler.RetryMax,
-	}, log.With(slog.String("comp", "scheduler")))
+	}, log.With(slog.String("comp", "scheduler")), bus)
 
-	notifSvc := notify.New(ad, log.With(slog.String("comp", "notifier")))
+	ncfg, err := mapNotifierConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	notifSvc := notify.New(ncfg, ad, log.With(slog.String("comp", "notifier")), bus)
 
 	// pprof service mapping (optional)
 	pprofCfg, err := mapPprofConfig(cfg)
@@ -121,6 +129,7 @@ func NewApp(cfgPath string) (*App, error) {
 			Adapter:     ad,
 			Config:      cfgm,
 			Services:    serv,
+			Bus:         bus,
 			OwnerUserID: cfg.Telegram.OwnerUserIDs,
 		}, cmdm)
 
@@ -129,6 +138,7 @@ func NewApp(cfgPath string) (*App, error) {
 		cfgm:    cfgm,
 		log:     log,
 		logs:    logSvc,
+		bus:     bus,
 		adapter: ad,
 		sched:   schedSvc,
 		notif:   notifSvc,
@@ -188,6 +198,10 @@ func (a *App) Start(ctx context.Context) error {
 			if _, err := mapPprofConfig(cfg); err != nil {
 				return err
 			}
+			// notifier validation (parse durations + basic bounds)
+			if _, err := mapNotifierConfig(cfg); err != nil {
+				return err
+			}
 			// per-plugin validation
 			if a.pm != nil {
 				return a.pm.ValidateConfig(c, cfg)
@@ -200,6 +214,9 @@ func (a *App) Start(ctx context.Context) error {
 		return err
 	}
 
+	if a.notif != nil && a.notif.Enabled() {
+		a.notif.Start(a.sup.Context())
+	}
 	if a.sched.Enabled() {
 		a.sched.Start(a.sup.Context())
 	}
@@ -214,6 +231,26 @@ func (a *App) Start(ctx context.Context) error {
 	a.sup.Go("commands.dispatch", func(c context.Context) error {
 		return a.cmdm.DispatchLoop(c, a.updates)
 	})
+
+	// Optional: log events for observability/debug (components can also subscribe themselves).
+	if a.bus != nil {
+		events, unsub := a.bus.Subscribe(128)
+		a.sup.Go0("eventbus.log", func(c context.Context) {
+			defer unsub()
+			for {
+				select {
+				case <-c.Done():
+					return
+				case e, ok := <-events:
+					if !ok {
+						return
+					}
+					// Keep this debug-level to avoid noise for frequent schedulers.
+					a.log.Debug("event", slog.String("type", e.Type), slog.Time("time", e.Time))
+				}
+			}
+		})
+	}
 
 	// hot reload config fan-out
 	sub := a.cfgm.Subscribe(8)
@@ -307,6 +344,26 @@ func (a *App) Start(ctx context.Context) error {
 				} else if !prevSchedEnabled && newCfg.Scheduler.Enabled {
 					a.log.Info("scheduler enabled via config")
 					a.sched.Start(c)
+				}
+
+				// apply notifier updates (live)
+				if a.notif != nil {
+					prevNotifEnabled := a.notif.Enabled()
+					ncfg, err := mapNotifierConfig(newCfg)
+					if err != nil {
+						a.log.Warn("invalid notifier config; keeping previous", slog.Any("err", err))
+					} else {
+						a.notif.Apply(ncfg)
+						if prevNotifEnabled && !ncfg.Enabled {
+							a.log.Info("notifier disabled via config")
+							stopCtx, cancel := context.WithTimeout(c, 3*time.Second)
+							a.notif.Stop(stopCtx)
+							cancel()
+						} else if !prevNotifEnabled && ncfg.Enabled {
+							a.log.Info("notifier enabled via config")
+							a.notif.Start(c)
+						}
+					}
 				}
 
 				// apply pprof updates (live)

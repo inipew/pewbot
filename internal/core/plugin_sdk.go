@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"pewbot/internal/eventbus"
 	"pewbot/internal/kit"
 )
 
@@ -110,6 +111,19 @@ func (b *PluginBase) Info(chatID int64, text string) error {
 		Text:     text,
 	}
 	return b.Notify(cctx, n)
+}
+
+// PublishEvent publishes a lightweight event to the in-process event bus (if present).
+// This is safe to call from plugins; Publish is non-blocking.
+func (b *PluginBase) PublishEvent(typ string, data any) {
+	if b == nil {
+		return
+	}
+	bus := b.Deps.Bus
+	if bus == nil {
+		return
+	}
+	bus.Publish(eventbus.Event{Type: typ, Data: data})
 }
 
 // DecodePluginConfig decodes per-plugin raw json into a typed config struct.

@@ -10,7 +10,25 @@ type Config struct {
 	Logging   LoggingConfig              `json:"logging"`
 	Pprof     PprofConfig                `json:"pprof,omitempty"`
 	Scheduler SchedulerConfig            `json:"scheduler"`
+	Notifier  *NotifierConfig            `json:"notifier,omitempty"`
 	Plugins   map[string]PluginConfigRaw `json:"plugins"`
+}
+
+// NotifierConfig controls the async notification pipeline.
+//
+// All durations are Go duration strings (e.g. "500ms", "10s", "1m").
+// If the whole section is omitted, the notifier defaults to enabled=true
+// for backwards compatibility.
+type NotifierConfig struct {
+	Enabled         bool   `json:"enabled"`
+	Workers         int    `json:"workers"`
+	QueueSize       int    `json:"queue_size"`
+	RatePerSec      int    `json:"rate_per_sec"`
+	RetryMax        int    `json:"retry_max"`
+	RetryBase       string `json:"retry_base"`
+	RetryMaxDelay   string `json:"retry_max_delay"`
+	DedupWindow     string `json:"dedup_window"`
+	DedupMaxEntries int    `json:"dedup_max_entries"`
 }
 
 // PprofConfig controls the optional pprof HTTP server.

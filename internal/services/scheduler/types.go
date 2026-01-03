@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"pewbot/internal/eventbus"
 )
 
 // Config controls the scheduler service.
@@ -68,6 +69,16 @@ type HistoryItem struct {
 	Error    string
 }
 
+// TaskEvent is emitted on the event bus for task lifecycle events.
+type TaskEvent struct {
+	ID       string        `json:"id"`
+	Name     string        `json:"name"`
+	Started  time.Time     `json:"started"`
+	Duration time.Duration `json:"duration"`
+	Attempts int           `json:"attempts"`
+	Error    string        `json:"error,omitempty"`
+}
+
 type task struct {
 	id      string
 	name    string
@@ -94,6 +105,7 @@ type Service struct {
 	log *slog.Logger
 	cfg Config
 	loc *time.Location
+	bus eventbus.Bus
 
 	parser cron.Parser
 	c      *cron.Cron

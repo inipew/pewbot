@@ -41,6 +41,17 @@
     "history_size": 200,
     "timezone": "Asia/Jakarta"
   },
+  "notifier": {
+    "enabled": true,
+    "workers": 2,
+    "queue_size": 512,
+    "rate_per_sec": 3,
+    "retry_max": 3,
+    "retry_base": "500ms",
+    "retry_max_delay": "10s",
+    "dedup_window": "1m",
+    "dedup_max_entries": 2000
+  },
   "plugins": {
     "echo": {
       "enabled": true,

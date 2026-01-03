@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"pewbot/internal/eventbus"
 	"pewbot/internal/kit"
 )
 
@@ -33,6 +34,7 @@ type PluginDeps struct {
 	Adapter     kit.Adapter
 	Config      *ConfigManager
 	Services    *Services
+	Bus         eventbus.Bus
 	OwnerUserID []int64
 }
 
