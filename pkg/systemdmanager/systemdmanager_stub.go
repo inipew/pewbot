@@ -134,6 +134,9 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
 	return &ServiceStatus{Name: serviceName, Active: "unknown", SubState: "unsupported", LoadState: "unsupported"}, nil
 }
+func (sm *ServiceManager) GetStatusDetailedContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
+	return sm.GetStatusContext(ctx, serviceName)
+}
 func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceStatus, error) {
 	sm.mu.RLock()
 	services := append([]string(nil), sm.services...)
@@ -143,6 +146,9 @@ func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceSta
 		out = append(out, ServiceStatus{Name: s, Active: "unknown", SubState: "unsupported", LoadState: "unsupported"})
 	}
 	return out, nil
+}
+func (sm *ServiceManager) GetAllStatusDetailedContext(ctx context.Context) ([]ServiceStatus, error) {
+	return sm.GetAllStatusContext(ctx)
 }
 func (sm *ServiceManager) GetFailedServices(ctx context.Context) ([]string, error) {
 	return []string{}, nil

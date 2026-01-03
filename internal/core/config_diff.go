@@ -62,17 +62,6 @@ func SummarizeConfigChange(oldCfg, newCfg *Config) ([]string, []slog.Attr, []str
 		)
 	}
 
-	// Broadcaster
-	if !reflect.DeepEqual(oldCfg.Broadcaster, newCfg.Broadcaster) {
-		changed = append(changed, "broadcaster")
-		attrs = append(attrs,
-			slog.Bool("broadcaster.enabled", newCfg.Broadcaster.Enabled),
-			slog.Int("broadcaster.workers", newCfg.Broadcaster.Workers),
-			slog.Int("broadcaster.rps", newCfg.Broadcaster.RatePerSec),
-			slog.Int("broadcaster.retry_max", newCfg.Broadcaster.RetryMax),
-		)
-	}
-
 	// Plugins (summarize only; details at debug)
 	pluginChanged := diffPlugins(oldCfg.Plugins, newCfg.Plugins)
 	if len(pluginChanged) > 0 {

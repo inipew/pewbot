@@ -10,7 +10,6 @@ import (
 
 	"pewbot/internal/adapters/telegram"
 	"pewbot/internal/kit"
-	"pewbot/internal/services/broadcast"
 	"pewbot/internal/services/logging"
 	"pewbot/internal/services/notify"
 	"pewbot/internal/services/scheduler"
@@ -28,7 +27,6 @@ type App struct {
 	adapter kit.Adapter
 
 	sched *scheduler.Service
-	bcast *broadcast.Service
 	notif *notify.Service
 
 	cmdm *CommandManager
@@ -98,19 +96,11 @@ func NewApp(cfgPath string) (*App, error) {
 		RetryMax:       cfg.Scheduler.RetryMax,
 	}, log.With(slog.String("comp", "scheduler")))
 
-	bcastSvc := broadcast.New(broadcast.Config{
-		Enabled:    cfg.Broadcaster.Enabled,
-		Workers:    cfg.Broadcaster.Workers,
-		RatePerSec: cfg.Broadcaster.RatePerSec,
-		RetryMax:   cfg.Broadcaster.RetryMax,
-	}, ad, log)
-
 	notifSvc := notify.New(ad, log.With(slog.String("comp", "notifier")))
 
 	serv := &Services{
-		Scheduler:   schedSvc,
-		Broadcaster: bcastSvc,
-		Notifier:    notifSvc,
+		Scheduler: schedSvc,
+		Notifier:  notifSvc,
 	}
 
 	cmdm := NewCommandManager(log.With(slog.String("comp", "commands")),
@@ -132,7 +122,6 @@ func NewApp(cfgPath string) (*App, error) {
 		logs:    logSvc,
 		adapter: ad,
 		sched:   schedSvc,
-		bcast:   bcastSvc,
 		notif:   notifSvc,
 		cmdm:    cmdm,
 		pm:      pm,
@@ -173,9 +162,6 @@ func (a *App) Start(ctx context.Context) error {
 			if cfg.Scheduler.RetryMax < 0 {
 				return fmt.Errorf("scheduler.retry_max must be >= 0")
 			}
-			if cfg.Broadcaster.Workers < 0 {
-				return fmt.Errorf("broadcaster.workers must be >= 0")
-			}
 			// duration/timezone validation (reject bad hot-reload)
 			if _, err := parseDurationField("scheduler.default_timeout", cfg.Scheduler.DefaultTimeout); err != nil {
 				return err
@@ -202,9 +188,6 @@ func (a *App) Start(ctx context.Context) error {
 
 	if a.sched.Enabled() {
 		a.sched.Start(a.sup.Context())
-	}
-	if a.bcast.Enabled() {
-		a.bcast.Start(a.sup.Context())
 	}
 
 	if err := a.pm.StartAll(a.sup.Context()); err != nil {
@@ -282,9 +265,8 @@ func (a *App) Start(ctx context.Context) error {
 				a.cmdm.SetOwners(newCfg.Telegram.OwnerUserIDs)
 				a.pm.SetOwnerUserIDs(newCfg.Telegram.OwnerUserIDs)
 
-				// apply scheduler/broadcast updates (live)
+				// apply scheduler updates (live)
 				prevSchedEnabled := a.sched.Enabled()
-				prevBcastEnabled := a.bcast.Enabled()
 				newDefaultTimeout, err := parseDurationField("scheduler.default_timeout", newCfg.Scheduler.DefaultTimeout)
 				if err != nil {
 					a.log.Warn("invalid scheduler.default_timeout; using 0", slog.Any("err", err))
@@ -298,12 +280,6 @@ func (a *App) Start(ctx context.Context) error {
 					Timezone:       newCfg.Scheduler.Timezone,
 					RetryMax:       newCfg.Scheduler.RetryMax,
 				})
-				a.bcast.Apply(broadcast.Config{
-					Enabled:    newCfg.Broadcaster.Enabled,
-					Workers:    newCfg.Broadcaster.Workers,
-					RatePerSec: newCfg.Broadcaster.RatePerSec,
-					RetryMax:   newCfg.Broadcaster.RetryMax,
-				})
 
 				// enable/disable services on the fly (was previously not handled)
 				if prevSchedEnabled && !newCfg.Scheduler.Enabled {
@@ -314,16 +290,6 @@ func (a *App) Start(ctx context.Context) error {
 				} else if !prevSchedEnabled && newCfg.Scheduler.Enabled {
 					a.log.Info("scheduler enabled via config")
 					a.sched.Start(c)
-				}
-
-				if prevBcastEnabled && !newCfg.Broadcaster.Enabled {
-					a.log.Info("broadcaster disabled via config")
-					stopCtx, cancel := context.WithTimeout(c, 3*time.Second)
-					a.bcast.Stop(stopCtx)
-					cancel()
-				} else if !prevBcastEnabled && newCfg.Broadcaster.Enabled {
-					a.log.Info("broadcaster enabled via config")
-					a.bcast.Start(c)
 				}
 
 				// apply plugin enable/disable + per-plugin config
@@ -425,9 +391,8 @@ func (a *App) Stop(ctx context.Context, reason StopReason) error {
 	// Stop plugins first (they may depend on services). StopAll is timeout-safe per-plugin.
 	step("plugins", 4*time.Second, func(c context.Context) error { a.pm.StopAll(c, reason); return nil })
 
-	// Stop services (order: scheduler/broadcaster/notifier/adapter)
+	// Stop services (order: scheduler/notifier/adapter)
 	step("scheduler", 2*time.Second, func(c context.Context) error { a.sched.Stop(c); return nil })
-	step("broadcaster", 2*time.Second, func(c context.Context) error { a.bcast.Stop(c); return nil })
 	step("notifier", 1*time.Second, func(c context.Context) error { a.notif.Stop(c); return nil })
 	step("adapter", 2*time.Second, func(c context.Context) error { return a.adapter.Stop(c) })
 
