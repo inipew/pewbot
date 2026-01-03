@@ -454,17 +454,17 @@ func isNoSuchUnitErr(err error) bool {
 // (auto-recover, watchers). It omits memory/uptime calculations and avoids
 // expensive enablement calls unless a cached value is present.
 func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
-	return sm.getStatusContext(ctx, serviceName, false)
+	return sm.getStatus(ctx, serviceName, false)
 }
 
 // GetStatusDetailedContext returns a full status snapshot including memory,
 // uptime, and enablement state. Use this for user-facing detail views; prefer
 // GetStatusContext for lightweight health checks.
 func (sm *ServiceManager) GetStatusDetailedContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
-	return sm.getStatusContext(ctx, serviceName, true)
+	return sm.getStatus(ctx, serviceName, true)
 }
 
-func (sm *ServiceManager) getStatusContext(ctx context.Context, serviceName string, detailed bool) (*ServiceStatus, error) {
+func (sm *ServiceManager) getStatus(ctx context.Context, serviceName string, detailed bool) (*ServiceStatus, error) {
 	sm.mu.RLock()
 	conn := sm.conn
 	sm.mu.RUnlock()
@@ -514,7 +514,7 @@ func (sm *ServiceManager) getStatusContext(ctx context.Context, serviceName stri
 	}
 
 	if detailed {
-		sm.populateDetailedFields(ctx, serviceName, status, props)
+		sm.fillDetailedFields(ctx, serviceName, status, props)
 	} else if en, ok := sm.cachedEnabled(serviceName, time.Now()); ok {
 		status.Enabled = en
 	}
@@ -532,7 +532,7 @@ func (sm *ServiceManager) cachedEnabled(serviceName string, now time.Time) (bool
 	return ent.enabled, true
 }
 
-func (sm *ServiceManager) populateDetailedFields(ctx context.Context, serviceName string, status *ServiceStatus, props map[string]interface{}) {
+func (sm *ServiceManager) fillDetailedFields(ctx context.Context, serviceName string, status *ServiceStatus, props map[string]interface{}) {
 	if status == nil || props == nil {
 		return
 	}
@@ -557,60 +557,49 @@ func (sm *ServiceManager) populateDetailedFields(ctx context.Context, serviceNam
 }
 
 func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceStatus, error) {
-	return sm.getAllStatusContext(ctx, false)
+	return sm.collectStatuses(ctx, false)
 }
 
 // GetAllStatusDetailedContext returns detailed status for all managed services.
 // It includes expensive fields (memory/uptime/enabled) and should be used for
 // operator views rather than high-frequency checks.
 func (sm *ServiceManager) GetAllStatusDetailedContext(ctx context.Context) ([]ServiceStatus, error) {
-	return sm.getAllStatusContext(ctx, true)
+	return sm.collectStatuses(ctx, true)
 }
 
-func (sm *ServiceManager) getAllStatusContext(ctx context.Context, detailed bool) ([]ServiceStatus, error) {
+func (sm *ServiceManager) collectStatuses(ctx context.Context, detailed bool) ([]ServiceStatus, error) {
 	sm.mu.RLock()
 	services := make([]string, len(sm.services))
 	copy(services, sm.services)
 	sm.mu.RUnlock()
 
 	statuses := make([]ServiceStatus, 0, len(services))
-	var (
-		mu sync.Mutex
-		wg sync.WaitGroup
-	)
+	for _, svc := range services {
+		svcCtx, cancel := context.WithTimeout(ctx, statusTimeout(detailed))
+		status, err := sm.getStatus(svcCtx, svc, detailed)
+		cancel()
 
-	for _, service := range services {
-		wg.Add(1)
-		svc := service
-
-		go func() {
-			defer wg.Done()
-
-			svcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-			defer cancel()
-
-			status, err := sm.getStatusContext(svcCtx, svc, detailed)
-			if err != nil {
-				mu.Lock()
-				statuses = append(statuses, ServiceStatus{
-					Name:      svc,
-					Active:    "unknown",
-					SubState:  "error",
-					LoadState: "not-found",
-				})
-				mu.Unlock()
-				return
-			}
-
-			mu.Lock()
-			statuses = append(statuses, *status)
-			mu.Unlock()
-		}()
+		if err != nil {
+			statuses = append(statuses, ServiceStatus{
+				Name:      svc,
+				Active:    "unknown",
+				SubState:  "error",
+				LoadState: "not-found",
+			})
+			continue
+		}
+		statuses = append(statuses, *status)
 	}
 
-	wg.Wait()
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Name < statuses[j].Name })
 	return statuses, nil
+}
+
+func statusTimeout(detailed bool) time.Duration {
+	if detailed {
+		return 2 * time.Second
+	}
+	return 1 * time.Second
 }
 
 func (sm *ServiceManager) GetFailedServices(ctx context.Context) ([]string, error) {
