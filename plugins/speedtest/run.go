@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -12,6 +14,14 @@ import (
 
 func (p *Plugin) runSpeedtest(ctx context.Context) (*SpeedtestResult, string, error) {
 	startTime := time.Now()
+
+	// Speedtest can allocate large buffers (download/upload).
+	// Force a GC + return memory to the OS after each run to prevent long
+	// plateaus when the bot is otherwise idle.
+	defer func() {
+		runtime.GC()
+		debug.FreeOSMemory()
+	}()
 
 	// Create timeout context
 	p.mu.RLock()
@@ -112,7 +122,7 @@ func (p *Plugin) testServersParallel(ctx context.Context, servers []*speedtest.S
 			}
 
 			p.Log.Debug("Testing server",
-				slog.String("name", s.Name),
+				slog.String("name", s.Sponsor),
 				slog.String("country", s.Country),
 			)
 

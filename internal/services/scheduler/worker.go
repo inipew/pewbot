@@ -144,7 +144,12 @@ attemptLoop:
 	defer s.hmu.Unlock()
 	s.history = append(s.history, item)
 	historySize := cfg.HistorySize
-	if historySize > 0 && len(s.history) > historySize {
+	// Safety: a zero/negative history_size previously meant unbounded growth.
+	// That can slowly retain memory on long-running bots, so we default to a sensible cap.
+	if historySize <= 0 {
+		historySize = 200
+	}
+	if len(s.history) > historySize {
 		s.history = s.history[len(s.history)-historySize:]
 	}
 }

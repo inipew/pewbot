@@ -136,10 +136,13 @@ func (s *Service) markFail(id string, t kit.ChatTarget) {
 	}
 }
 func (s *Service) finish(id string) {
+	now := time.Now()
 	s.statusMu.Lock()
-	defer s.statusMu.Unlock()
 	if st := s.status[id]; st != nil {
-		st.DoneAt = time.Now()
+		st.DoneAt = now
 		st.Running = false
 	}
+	s.statusMu.Unlock()
+	// Keep the map bounded even if nobody queries old job IDs.
+	s.pruneStatus(now)
 }

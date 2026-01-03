@@ -97,7 +97,7 @@ func (m *ConfigManager) Get() *Config {
 	return m.cfg
 }
 
-func (m *ConfigManager) Subscribe(buffer int) <-chan *Config {
+func (m *ConfigManager) Subscribe(buffer int) chan *Config {
 	ch := make(chan *Config, buffer)
 	m.mu.Lock()
 	m.subs = append(m.subs, ch)
@@ -105,11 +105,32 @@ func (m *ConfigManager) Subscribe(buffer int) <-chan *Config {
 	return ch
 }
 
+func (m *ConfigManager) Unsubscribe(ch chan *Config) {
+	if ch == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, s := range m.subs {
+		if s == ch {
+			// swap-remove (order doesn't matter)
+			last := len(m.subs) - 1
+			m.subs[i] = m.subs[last]
+			m.subs[last] = nil
+			m.subs = m.subs[:last]
+			return
+		}
+	}
+}
+
 func (m *ConfigManager) publish(cfg *Config) {
 	m.mu.RLock()
 	subs := append([]chan *Config{}, m.subs...)
 	m.mu.RUnlock()
 	for _, ch := range subs {
+		if ch == nil {
+			continue
+		}
 		// Always try to deliver the latest config.
 		// If subscriber is slow and buffer is full, drop ONE oldest item then push the newest.
 		select {

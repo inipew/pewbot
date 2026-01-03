@@ -218,6 +218,7 @@ func (a *App) Start(ctx context.Context) error {
 	// hot reload config fan-out
 	sub := a.cfgm.Subscribe(8)
 	a.sup.Go0("config.reload", func(c context.Context) {
+		defer a.cfgm.Unsubscribe(sub)
 		// Track last applied config to generate a safe diff summary for logging.
 		lastApplied := a.cfgm.Get()
 		for {

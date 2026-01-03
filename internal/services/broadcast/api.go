@@ -10,8 +10,10 @@ import (
 )
 
 func (s *Service) NewJob(name string, targets []kit.ChatTarget, text string, opt *kit.SendOptions) string {
-	id := fmt.Sprintf("bc:%d", time.Now().UnixNano())
-	st := &JobStatus{ID: id, Name: name, Total: len(targets)}
+	now := time.Now()
+	id := fmt.Sprintf("bc:%d", now.UnixNano())
+	s.pruneStatus(now)
+	st := &JobStatus{ID: id, Name: name, Total: len(targets), CreatedAt: now}
 	s.statusMu.Lock()
 	s.status[id] = st
 	s.statusMu.Unlock()

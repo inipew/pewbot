@@ -16,13 +16,18 @@ func New(cfg Config, adapter kit.Adapter, log *slog.Logger) *Service {
 	if rps <= 0 {
 		rps = 10
 	}
+	// Bound the status cache by default to prevent unbounded growth over time.
+	statusMax := 200
+	statusTTL := 24 * time.Hour
 	return &Service{
-		cfg:     cfg,
-		adapter: adapter,
-		log:     log,
-		limiter: rate.NewLimiter(rate.Limit(rps), rps),
-		queue:   make(chan job, 256),
-		status:  map[string]*JobStatus{},
+		cfg:       cfg,
+		adapter:   adapter,
+		log:       log,
+		limiter:   rate.NewLimiter(rate.Limit(rps), rps),
+		queue:     make(chan job, 256),
+		status:    map[string]*JobStatus{},
+		statusMax: statusMax,
+		statusTTL: statusTTL,
 	}
 }
 

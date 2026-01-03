@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const defaultMaxHistory = 10000
+
 func (p *Plugin) saveResult(result *SpeedtestResult) error {
 	p.mu.RLock()
 	historyFile := p.cfg.HistoryFile
@@ -20,6 +22,9 @@ func (p *Plugin) saveResult(result *SpeedtestResult) error {
 	// Add to in-memory history
 	p.history.mu.Lock()
 	p.history.Results = append(p.history.Results, *result)
+	if len(p.history.Results) > defaultMaxHistory {
+		p.history.Results = p.history.Results[len(p.history.Results)-defaultMaxHistory:]
+	}
 	p.history.mu.Unlock()
 
 	// Save to file
@@ -43,6 +48,9 @@ func (p *Plugin) loadHistory(filename string) error {
 
 	p.history.mu.Lock()
 	p.history.Results = history.Results
+	if len(p.history.Results) > defaultMaxHistory {
+		p.history.Results = p.history.Results[len(p.history.Results)-defaultMaxHistory:]
+	}
 	p.history.mu.Unlock()
 
 	return nil
