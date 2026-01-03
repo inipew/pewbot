@@ -4,7 +4,6 @@ Modular Telegram bot framework (single operator) dengan:
 - Hot-reload JSON config
 - Plugin system + per-plugin timeout (duration string)
 - Scheduler (one-time/interval/daily/weekly/cron) + worker pool + retry + history/statistics
-- Broadcaster (concurrent + rate limit + retry + job progress) + group recipients
 - Notifier (multi-channel + priority routes + history)
 - Smart logging (console/file/Telegram sink + rate limit + min-level)
 - Middleware (panic recovery + request logging)

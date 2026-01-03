@@ -6,11 +6,10 @@ import (
 )
 
 type Config struct {
-	Telegram    TelegramConfig             `json:"telegram"`
-	Logging     LoggingConfig              `json:"logging"`
-	Scheduler   SchedulerConfig            `json:"scheduler"`
-	Broadcaster BroadcasterConfig          `json:"broadcaster"`
-	Plugins     map[string]PluginConfigRaw `json:"plugins"`
+	Telegram  TelegramConfig             `json:"telegram"`
+	Logging   LoggingConfig              `json:"logging"`
+	Scheduler SchedulerConfig            `json:"scheduler"`
+	Plugins   map[string]PluginConfigRaw `json:"plugins"`
 }
 
 type TelegramConfig struct {
@@ -48,14 +47,6 @@ type SchedulerConfig struct {
 	Timezone       string `json:"timezone,omitempty"`
 	RetryMax       int    `json:"retry_max,omitempty"`
 }
-
-type BroadcasterConfig struct {
-	Enabled    bool `json:"enabled"`
-	Workers    int  `json:"workers"`
-	RatePerSec int  `json:"rate_per_sec"`
-	RetryMax   int  `json:"retry_max"`
-}
-
 type PluginConfigRaw struct {
 	Enabled bool            `json:"enabled"`
 	Config  json.RawMessage `json:"config,omitempty"`

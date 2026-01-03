@@ -67,9 +67,8 @@ type Request struct {
 }
 
 type Services struct {
-	Scheduler   SchedulerPort
-	Broadcaster BroadcasterPort
-	Notifier    NotifierPort
+	Scheduler SchedulerPort
+	Notifier  NotifierPort
 }
 
 type SchedulerPort interface {
@@ -88,13 +87,6 @@ type SchedulerPort interface {
 
 	Remove(name string) bool
 }
-
-type BroadcasterPort interface {
-	NewJob(name string, targets []kit.ChatTarget, text string, opt *kit.SendOptions) string
-	StartJob(ctx context.Context, jobID string) error
-	Status(jobID string) (any, bool)
-}
-
 type NotifierPort interface {
 	Notify(ctx context.Context, n kit.Notification) error
 }
