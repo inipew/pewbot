@@ -85,6 +85,7 @@ type enabledCacheEntry struct {
 }
 
 const defaultEnabledCacheTTL = 5 * time.Minute
+const maxEnabledCacheEntries = 128
 
 //
 // Construction & lifecycle
@@ -405,6 +406,10 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 		sm.mu.RUnlock()
 		return false
 	}
+	// opportunistic cleanup of expired cache entries
+	if sm.enabledCache != nil {
+		sm.cleanupEnabledCacheLocked(now)
+	}
 	if ent, ok := sm.enabledCache[serviceName]; ok && now.Before(ent.expires) {
 		en := ent.enabled
 		sm.mu.RUnlock()
@@ -432,6 +437,7 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 		sm.enabledCache = map[string]enabledCacheEntry{}
 	}
 	sm.enabledCache[serviceName] = enabledCacheEntry{enabled: enabled, expires: now.Add(ttl)}
+	sm.pruneEnabledCacheLocked()
 	sm.mu.Unlock()
 
 	return enabled
@@ -769,4 +775,30 @@ func formatOperationMessage(action, serviceName string, err error) string {
 
 func FormatActionResult(serviceName, action string, err error) string {
 	return formatOperationMessage(action, serviceName, err)
+}
+
+func (sm *ServiceManager) cleanupEnabledCacheLocked(now time.Time) {
+	for k, v := range sm.enabledCache {
+		if now.After(v.expires) {
+			delete(sm.enabledCache, k)
+		}
+	}
+}
+
+func (sm *ServiceManager) pruneEnabledCacheLocked() {
+	if len(sm.enabledCache) <= maxEnabledCacheEntries {
+		return
+	}
+	// Remove the entry with the soonest expiration to bias toward fresher data.
+	var victim string
+	var earliest time.Time
+	for k, v := range sm.enabledCache {
+		if earliest.IsZero() || v.expires.Before(earliest) {
+			victim = k
+			earliest = v.expires
+		}
+	}
+	if victim != "" {
+		delete(sm.enabledCache, victim)
+	}
 }
