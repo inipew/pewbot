@@ -28,12 +28,6 @@
     "history_size": 200,
     "timezone": "Asia/Jakarta"
   },
-  "broadcaster": {
-    "enabled": true,
-    "workers": 4,
-    "rate_per_sec": 20,
-    "retry_max": 3
-  },
   "plugins": {
     "echo": {
       "enabled": true,

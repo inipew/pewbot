@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"pewbot/internal/core"
 )
@@ -92,16 +93,14 @@ func (p *Plugin) handleHistory(ctx context.Context, req *core.Request) error {
 	p.mu.RUnlock()
 
 	// Default to 5 recent results
-	count := 5
-	if len(req.Args) > 0 {
-		if n, err := fmt.Sscanf(req.Args[0], "%d", &count); err == nil && n == 1 {
-			if count > 20 {
-				count = 20 // Limit to 20
-			}
-		}
-	}
+	count := clampPositiveIntArg(req.Args, 5, 20)
 
-	results := p.getRecentResults(count)
+	results, err := p.getRecentResults(count)
+	if err != nil {
+		p.Log.Warn("Failed to read history", slog.Any("err", err))
+		_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+"Failed to read history", nil)
+		return nil
+	}
 	if len(results) == 0 {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+"No speedtest history available", nil)
 		return nil
@@ -131,29 +130,33 @@ func (p *Plugin) handleHistory(ctx context.Context, req *core.Request) error {
 func (p *Plugin) handleClean(ctx context.Context, req *core.Request) error {
 	p.mu.RLock()
 	prefix := p.cfg.Prefix
-	historyFile := p.cfg.HistoryFile
 	p.mu.RUnlock()
 
 	// Default to 30 days
-	days := 30
-	if len(req.Args) > 0 {
-		if n, err := fmt.Sscanf(req.Args[0], "%d", &days); err == nil && n == 1 {
-			if days < 1 {
-				days = 1
-			}
-		}
-	}
+	days := clampPositiveIntArg(req.Args, 30, 365)
 
-	removed := p.cleanOldResults(days)
-
-	// Save cleaned history
-	if historyFile != "" {
-		if err := p.saveHistory(historyFile); err != nil {
-			p.Log.Warn("Failed to save cleaned history", slog.String("error", err.Error()))
-		}
+	removed, err := p.cleanOldResults(days)
+	if err != nil {
+		p.Log.Warn("Failed to clean history", slog.Any("err", err))
+		_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+"Failed to clean history: "+err.Error(), nil)
+		return nil
 	}
 
 	msg := fmt.Sprintf("🧹 Cleaned %d results older than %d days", removed, days)
 	_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+msg, nil)
 	return nil
+}
+
+func clampPositiveIntArg(args []string, defVal, maxVal int) int {
+	if len(args) == 0 {
+		return defVal
+	}
+	n, err := strconv.Atoi(args[0])
+	if err != nil || n < 1 {
+		return defVal
+	}
+	if maxVal > 0 && n > maxVal {
+		return maxVal
+	}
+	return n
 }

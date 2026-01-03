@@ -11,11 +11,7 @@ import (
 )
 
 func New() *Plugin {
-	return &Plugin{
-		history: &SpeedtestHistory{
-			Results: make([]SpeedtestResult, 0),
-		},
-	}
+	return &Plugin{}
 }
 
 // Name returns plugin name
@@ -32,16 +28,16 @@ func (p *Plugin) Init(ctx context.Context, deps core.PluginDeps) error {
 // Start starts the plugin
 func (p *Plugin) Start(ctx context.Context) error {
 	p.StartEnhanced(ctx)
-	// Load existing history if configured
+	// Load/compact existing history if configured without retaining it in memory.
 	p.mu.RLock()
 	historyFile := p.cfg.HistoryFile
 	p.mu.RUnlock()
 
 	if historyFile != "" {
-		if err := p.loadHistory(historyFile); err != nil {
-			p.Log.Warn("Failed to load history", slog.Any("err", err))
-		} else {
-			p.Log.Info("History loaded", slog.Int("count", len(p.history.Results)))
+		if count, err := p.compactHistoryFile(historyFile); err != nil {
+			p.Log.Warn("Failed to compact history", slog.Any("err", err))
+		} else if count > 0 {
+			p.Log.Info("History loaded", slog.Int("count", count))
 		}
 	}
 	return nil

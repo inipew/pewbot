@@ -9,7 +9,6 @@ type Config struct {
 	Telegram    TelegramConfig             `json:"telegram"`
 	Logging     LoggingConfig              `json:"logging"`
 	Scheduler   SchedulerConfig            `json:"scheduler"`
-	Broadcaster BroadcasterConfig          `json:"broadcaster"`
 	Plugins     map[string]PluginConfigRaw `json:"plugins"`
 }
 
@@ -47,13 +46,6 @@ type SchedulerConfig struct {
 	HistorySize    int    `json:"history_size"`
 	Timezone       string `json:"timezone,omitempty"`
 	RetryMax       int    `json:"retry_max,omitempty"`
-}
-
-type BroadcasterConfig struct {
-	Enabled    bool `json:"enabled"`
-	Workers    int  `json:"workers"`
-	RatePerSec int  `json:"rate_per_sec"`
-	RetryMax   int  `json:"retry_max"`
 }
 
 type PluginConfigRaw struct {

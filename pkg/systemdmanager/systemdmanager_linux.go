@@ -85,6 +85,7 @@ type enabledCacheEntry struct {
 }
 
 const defaultEnabledCacheTTL = 5 * time.Minute
+const maxEnabledCacheEntries = 128
 
 //
 // Construction & lifecycle
@@ -405,6 +406,10 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 		sm.mu.RUnlock()
 		return false
 	}
+	// opportunistic cleanup of expired cache entries
+	if sm.enabledCache != nil {
+		sm.cleanupEnabledCacheLocked(now)
+	}
 	if ent, ok := sm.enabledCache[serviceName]; ok && now.Before(ent.expires) {
 		en := ent.enabled
 		sm.mu.RUnlock()
@@ -432,6 +437,7 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 		sm.enabledCache = map[string]enabledCacheEntry{}
 	}
 	sm.enabledCache[serviceName] = enabledCacheEntry{enabled: enabled, expires: now.Add(ttl)}
+	sm.pruneEnabledCacheLocked()
 	sm.mu.Unlock()
 
 	return enabled
@@ -450,7 +456,21 @@ func isNoSuchUnitErr(err error) bool {
 	return strings.Contains(es, "not-found")
 }
 
+// GetStatusContext returns a lightweight snapshot suitable for frequent checks
+// (auto-recover, watchers). It omits memory/uptime calculations and avoids
+// expensive enablement calls unless a cached value is present.
 func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
+	return sm.getStatus(ctx, serviceName, false)
+}
+
+// GetStatusDetailedContext returns a full status snapshot including memory,
+// uptime, and enablement state. Use this for user-facing detail views; prefer
+// GetStatusContext for lightweight health checks.
+func (sm *ServiceManager) GetStatusDetailedContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
+	return sm.getStatus(ctx, serviceName, true)
+}
+
+func (sm *ServiceManager) getStatus(ctx context.Context, serviceName string, detailed bool) (*ServiceStatus, error) {
 	sm.mu.RLock()
 	conn := sm.conn
 	sm.mu.RUnlock()
@@ -493,12 +513,36 @@ func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName stri
 		SubState:      subState,
 		LoadState:     loadState,
 		Description:   description,
-		Enabled:       sm.IsEnabled(ctx, serviceName),
 		ActiveSince:   parseTimestamp(props, "ActiveEnterTimestamp"),
 		ActiveExit:    parseTimestamp(props, "ActiveExitTimestamp"),
 		InactiveSince: parseTimestamp(props, "InactiveEnterTimestamp"),
 		StateChange:   parseTimestamp(props, "StateChangeTimestamp"),
 	}
+
+	if detailed {
+		sm.fillDetailedFields(ctx, serviceName, status, props)
+	} else if en, ok := sm.cachedEnabled(serviceName, time.Now()); ok {
+		status.Enabled = en
+	}
+
+	return status, nil
+}
+
+func (sm *ServiceManager) cachedEnabled(serviceName string, now time.Time) (bool, bool) {
+	sm.mu.RLock()
+	ent, ok := sm.enabledCache[serviceName]
+	sm.mu.RUnlock()
+	if !ok || now.After(ent.expires) {
+		return false, false
+	}
+	return ent.enabled, true
+}
+
+func (sm *ServiceManager) fillDetailedFields(ctx context.Context, serviceName string, status *ServiceStatus, props map[string]interface{}) {
+	if status == nil || props == nil {
+		return
+	}
+	status.Enabled = sm.IsEnabled(ctx, serviceName)
 
 	if mem, ok := props["MemoryCurrent"].(uint64); ok && mem > 0 {
 		status.Memory = mem
@@ -516,108 +560,52 @@ func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName stri
 		startTime := time.Unix(int64(ts/1_000_000), 0)
 		status.Uptime = time.Since(startTime)
 	}
-
-	return status, nil
-}
-
-// GetStatusLiteContext is a cheaper variant of GetStatusContext.
-// It only fetches core state + timestamps, skipping Enabled/Memory/Uptime.
-// Useful for high-frequency checks (e.g., auto-recover tick) to reduce load and
-// avoid retaining large allocations from repeated D-Bus calls.
-func (sm *ServiceManager) GetStatusLiteContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
-	sm.mu.RLock()
-	conn := sm.conn
-	sm.mu.RUnlock()
-
-	if conn == nil {
-		return nil, fmt.Errorf("systemd connection is closed")
-	}
-
-	unitName := serviceName + ".service"
-	props, err := conn.GetUnitPropertiesContext(ctx, unitName)
-	if err != nil {
-		if isNoSuchUnitErr(err) {
-			return &ServiceStatus{
-				Name:      serviceName,
-				Active:    "unknown",
-				SubState:  "not-found",
-				LoadState: "not-found",
-			}, nil
-		}
-		return nil, fmt.Errorf("failed to get status for %s: %w", serviceName, err)
-	}
-
-	activeState, _ := getStringProperty(props, "ActiveState")
-	subState, _ := getStringProperty(props, "SubState")
-	loadState, _ := getStringProperty(props, "LoadState")
-	description, _ := getStringProperty(props, "Description")
-
-	if loadState == "not-found" {
-		return &ServiceStatus{
-			Name:      serviceName,
-			Active:    "unknown",
-			SubState:  "not-found",
-			LoadState: "not-found",
-		}, nil
-	}
-
-	return &ServiceStatus{
-		Name:          serviceName,
-		Active:        activeState,
-		SubState:      subState,
-		LoadState:     loadState,
-		Description:   description,
-		ActiveSince:   parseTimestamp(props, "ActiveEnterTimestamp"),
-		ActiveExit:    parseTimestamp(props, "ActiveExitTimestamp"),
-		InactiveSince: parseTimestamp(props, "InactiveEnterTimestamp"),
-		StateChange:   parseTimestamp(props, "StateChangeTimestamp"),
-	}, nil
 }
 
 func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceStatus, error) {
+	return sm.collectStatuses(ctx, false)
+}
+
+// GetAllStatusDetailedContext returns detailed status for all managed services.
+// It includes expensive fields (memory/uptime/enabled) and should be used for
+// operator views rather than high-frequency checks.
+func (sm *ServiceManager) GetAllStatusDetailedContext(ctx context.Context) ([]ServiceStatus, error) {
+	return sm.collectStatuses(ctx, true)
+}
+
+func (sm *ServiceManager) collectStatuses(ctx context.Context, detailed bool) ([]ServiceStatus, error) {
 	sm.mu.RLock()
 	services := make([]string, len(sm.services))
 	copy(services, sm.services)
 	sm.mu.RUnlock()
 
 	statuses := make([]ServiceStatus, 0, len(services))
-	var (
-		mu sync.Mutex
-		wg sync.WaitGroup
-	)
+	for _, svc := range services {
+		svcCtx, cancel := context.WithTimeout(ctx, statusTimeout(detailed))
+		status, err := sm.getStatus(svcCtx, svc, detailed)
+		cancel()
 
-	for _, service := range services {
-		wg.Add(1)
-		svc := service
-
-		go func() {
-			defer wg.Done()
-
-			svcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-			defer cancel()
-
-			status, err := sm.GetStatusContext(svcCtx, svc)
-			if err != nil {
-				mu.Lock()
-				statuses = append(statuses, ServiceStatus{
-					Name:      svc,
-					Active:    "unknown",
-					SubState:  "error",
-					LoadState: "not-found",
-				})
-				mu.Unlock()
-				return
-			}
-
-			mu.Lock()
-			statuses = append(statuses, *status)
-			mu.Unlock()
-		}()
+		if err != nil {
+			statuses = append(statuses, ServiceStatus{
+				Name:      svc,
+				Active:    "unknown",
+				SubState:  "error",
+				LoadState: "not-found",
+			})
+			continue
+		}
+		statuses = append(statuses, *status)
 	}
 
-	wg.Wait()
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Name < statuses[j].Name })
 	return statuses, nil
+}
+
+func statusTimeout(detailed bool) time.Duration {
+	if detailed {
+		return 2 * time.Second
+	}
+	return 1 * time.Second
 }
 
 func (sm *ServiceManager) GetFailedServices(ctx context.Context) ([]string, error) {
@@ -787,4 +775,30 @@ func formatOperationMessage(action, serviceName string, err error) string {
 
 func FormatActionResult(serviceName, action string, err error) string {
 	return formatOperationMessage(action, serviceName, err)
+}
+
+func (sm *ServiceManager) cleanupEnabledCacheLocked(now time.Time) {
+	for k, v := range sm.enabledCache {
+		if now.After(v.expires) {
+			delete(sm.enabledCache, k)
+		}
+	}
+}
+
+func (sm *ServiceManager) pruneEnabledCacheLocked() {
+	if len(sm.enabledCache) <= maxEnabledCacheEntries {
+		return
+	}
+	// Remove the entry with the soonest expiration to bias toward fresher data.
+	var victim string
+	var earliest time.Time
+	for k, v := range sm.enabledCache {
+		if earliest.IsZero() || v.expires.Before(earliest) {
+			victim = k
+			earliest = v.expires
+		}
+	}
+	if victim != "" {
+		delete(sm.enabledCache, victim)
+	}
 }

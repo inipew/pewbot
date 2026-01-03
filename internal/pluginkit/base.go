@@ -18,7 +18,6 @@ type EnhancedPluginBase struct {
 	// New helper APIs.
 	schedule *ScheduleHelper
 	notify   *NotifyHelper
-	bcast    *BroadcastHelper
 }
 
 // InitEnhanced initializes the embedded core.PluginBase and constructs helpers.
@@ -27,7 +26,6 @@ func (b *EnhancedPluginBase) InitEnhanced(deps core.PluginDeps, pluginName strin
 	// Helpers are nil-safe; they may wrap nil services in minimal environments.
 	b.schedule = NewScheduleHelper(pluginName, deps.Services)
 	b.notify = NewNotifyHelper(pluginName, deps)
-	b.bcast = NewBroadcastHelper(pluginName, deps.Services)
 }
 
 // StartEnhanced extends StartBase with helper context binding.
@@ -38,9 +36,6 @@ func (b *EnhancedPluginBase) StartEnhanced(ctx context.Context) {
 	}
 	if b.notify != nil {
 		b.notify.bindContext(ctx)
-	}
-	if b.bcast != nil {
-		b.bcast.bindContext(ctx)
 	}
 }
 
@@ -57,6 +52,3 @@ func (b *EnhancedPluginBase) Schedule() *ScheduleHelper { return b.schedule }
 
 // Notify returns the notifier helper.
 func (b *EnhancedPluginBase) Notify() *NotifyHelper { return b.notify }
-
-// Broadcast returns the broadcast helper.
-func (b *EnhancedPluginBase) Broadcast() *BroadcastHelper { return b.bcast }
