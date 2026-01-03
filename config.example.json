@@ -21,6 +21,12 @@
       "rate_per_sec": 2
     }
   },
+  "pprof": {
+    "enabled": false,
+    "address": "127.0.0.1:6060",
+    "block_profile_rate": 0,
+    "mutex_profile_fraction": 0
+  },
   "scheduler": {
     "enabled": true,
     "workers": 4,

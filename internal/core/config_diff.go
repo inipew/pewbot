@@ -51,6 +51,20 @@ func SummarizeConfigChange(oldCfg, newCfg *Config) ([]string, []slog.Attr, []str
 		)
 	}
 
+	// Pprof
+	if oldCfg.Pprof.Enabled != newCfg.Pprof.Enabled ||
+		strings.TrimSpace(oldCfg.Pprof.Address) != strings.TrimSpace(newCfg.Pprof.Address) ||
+		oldCfg.Pprof.BlockProfileRate != newCfg.Pprof.BlockProfileRate ||
+		oldCfg.Pprof.MutexProfileFraction != newCfg.Pprof.MutexProfileFraction {
+		changed = append(changed, "pprof")
+		attrs = append(attrs,
+			slog.Bool("pprof.enabled", newCfg.Pprof.Enabled),
+			slog.String("pprof.address", strings.TrimSpace(newCfg.Pprof.Address)),
+			slog.Int("pprof.block_profile_rate", newCfg.Pprof.BlockProfileRate),
+			slog.Int("pprof.mutex_profile_fraction", newCfg.Pprof.MutexProfileFraction),
+		)
+	}
+
 	// Scheduler
 	if !reflect.DeepEqual(oldCfg.Scheduler, newCfg.Scheduler) {
 		changed = append(changed, "scheduler")

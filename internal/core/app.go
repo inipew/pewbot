@@ -32,6 +32,8 @@ type App struct {
 	cmdm *CommandManager
 	pm   *PluginManager
 
+	pprof *pprofServer
+
 	updates chan kit.Update
 }
 
@@ -115,6 +117,9 @@ func NewApp(cfgPath string) (*App, error) {
 			OwnerUserID: cfg.Telegram.OwnerUserIDs,
 		}, cmdm)
 
+	pp := newPprofServer(log)
+	pp.Apply(context.Background(), cfg.Pprof)
+
 	return &App{
 		cfgPath: cfgPath,
 		cfgm:    cfgm,
@@ -125,6 +130,7 @@ func NewApp(cfgPath string) (*App, error) {
 		notif:   notifSvc,
 		cmdm:    cmdm,
 		pm:      pm,
+		pprof:   pp,
 		updates: make(chan kit.Update, 256),
 	}, nil
 }
@@ -173,6 +179,9 @@ func (a *App) Start(ctx context.Context) error {
 				if _, err := time.LoadLocation(tz); err != nil {
 					return fmt.Errorf("scheduler.timezone: invalid %q: %w", tz, err)
 				}
+			}
+			if cfg.Pprof.Enabled && strings.TrimSpace(cfg.Pprof.Address) == "" {
+				return fmt.Errorf("pprof.address is required when pprof.enabled=true")
 			}
 			// per-plugin validation
 			if a.pm != nil {
@@ -264,6 +273,11 @@ func (a *App) Start(ctx context.Context) error {
 				// Update owner list used for AccessOwnerOnly checks and plugin deps.
 				a.cmdm.SetOwners(newCfg.Telegram.OwnerUserIDs)
 				a.pm.SetOwnerUserIDs(newCfg.Telegram.OwnerUserIDs)
+
+				// pprof toggle/update
+				if a.pprof != nil {
+					a.pprof.Apply(c, newCfg.Pprof)
+				}
 
 				// apply scheduler updates (live)
 				prevSchedEnabled := a.sched.Enabled()
@@ -395,6 +409,12 @@ func (a *App) Stop(ctx context.Context, reason StopReason) error {
 	step("scheduler", 2*time.Second, func(c context.Context) error { a.sched.Stop(c); return nil })
 	step("notifier", 1*time.Second, func(c context.Context) error { a.notif.Stop(c); return nil })
 	step("adapter", 2*time.Second, func(c context.Context) error { return a.adapter.Stop(c) })
+	step("pprof", 1*time.Second, func(c context.Context) error {
+		if a.pprof != nil {
+			a.pprof.Stop(c)
+		}
+		return nil
+	})
 
 	// Finally, wait for supervised goroutines (config watch/reload, command dispatcher, etc.)
 	step("supervisor", 2*time.Second, func(c context.Context) error { return a.sup.Wait(c) })

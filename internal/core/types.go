@@ -6,10 +6,11 @@ import (
 )
 
 type Config struct {
-	Telegram    TelegramConfig             `json:"telegram"`
-	Logging     LoggingConfig              `json:"logging"`
-	Scheduler   SchedulerConfig            `json:"scheduler"`
-	Plugins     map[string]PluginConfigRaw `json:"plugins"`
+	Telegram  TelegramConfig             `json:"telegram"`
+	Logging   LoggingConfig              `json:"logging"`
+	Scheduler SchedulerConfig            `json:"scheduler"`
+	Pprof     PprofConfig                `json:"pprof"`
+	Plugins   map[string]PluginConfigRaw `json:"plugins"`
 }
 
 type TelegramConfig struct {
