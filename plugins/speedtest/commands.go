@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-
 	"pewbot/internal/core"
 )
 
@@ -131,7 +130,6 @@ func (p *Plugin) handleHistory(ctx context.Context, req *core.Request) error {
 func (p *Plugin) handleClean(ctx context.Context, req *core.Request) error {
 	p.mu.RLock()
 	prefix := p.cfg.Prefix
-	historyFile := p.cfg.HistoryFile
 	p.mu.RUnlock()
 
 	// Default to 30 days
@@ -145,13 +143,6 @@ func (p *Plugin) handleClean(ctx context.Context, req *core.Request) error {
 	}
 
 	removed := p.cleanOldResults(days)
-
-	// Save cleaned history
-	if historyFile != "" {
-		if err := p.saveHistory(historyFile); err != nil {
-			p.Log.Warn("Failed to save cleaned history", slog.String("error", err.Error()))
-		}
-	}
 
 	msg := fmt.Sprintf("🧹 Cleaned %d results older than %d days", removed, days)
 	_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+msg, nil)

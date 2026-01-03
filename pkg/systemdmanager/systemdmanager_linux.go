@@ -105,6 +105,37 @@ func NewServiceManager(services []string) (*ServiceManager, error) {
 	}, nil
 }
 
+// SetEnabledCacheTTL updates the IsEnabled cache TTL.
+//
+// Semantics:
+//   - ttl == 0 : use default TTL
+//   - ttl < 0  : disable caching (every call hits D-Bus)
+func (sm *ServiceManager) SetEnabledCacheTTL(ttl time.Duration) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if ttl == 0 {
+		ttl = defaultEnabledCacheTTL
+	}
+	sm.enabledTTL = ttl
+	// Clear entries so callers observe the new policy immediately.
+	if sm.enabledCache != nil {
+		for k := range sm.enabledCache {
+			delete(sm.enabledCache, k)
+		}
+	}
+}
+
+// ClearEnabledCache clears cached IsEnabled results.
+func (sm *ServiceManager) ClearEnabledCache() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.enabledCache != nil {
+		for k := range sm.enabledCache {
+			delete(sm.enabledCache, k)
+		}
+	}
+}
+
 // Close closes the systemd connection.
 func (sm *ServiceManager) Close() error {
 	sm.mu.Lock()
@@ -398,17 +429,20 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 	sm.mu.RLock()
 	conn := sm.conn
 	ttl := sm.enabledTTL
-	if ttl <= 0 {
+	// ttl == 0 => default TTL; ttl < 0 => disable caching entirely.
+	if ttl == 0 {
 		ttl = defaultEnabledCacheTTL
 	}
 	if conn == nil {
 		sm.mu.RUnlock()
 		return false
 	}
-	if ent, ok := sm.enabledCache[serviceName]; ok && now.Before(ent.expires) {
-		en := ent.enabled
-		sm.mu.RUnlock()
-		return en
+	if ttl >= 0 {
+		if ent, ok := sm.enabledCache[serviceName]; ok && now.Before(ent.expires) {
+			en := ent.enabled
+			sm.mu.RUnlock()
+			return en
+		}
 	}
 	sm.mu.RUnlock()
 
@@ -427,12 +461,14 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 		}
 	}
 
-	sm.mu.Lock()
-	if sm.enabledCache == nil {
-		sm.enabledCache = map[string]enabledCacheEntry{}
+	if ttl >= 0 {
+		sm.mu.Lock()
+		if sm.enabledCache == nil {
+			sm.enabledCache = map[string]enabledCacheEntry{}
+		}
+		sm.enabledCache[serviceName] = enabledCacheEntry{enabled: enabled, expires: now.Add(ttl)}
+		sm.mu.Unlock()
 	}
-	sm.enabledCache[serviceName] = enabledCacheEntry{enabled: enabled, expires: now.Add(ttl)}
-	sm.mu.Unlock()
 
 	return enabled
 }
@@ -450,7 +486,103 @@ func isNoSuchUnitErr(err error) bool {
 	return strings.Contains(es, "not-found")
 }
 
+// GetStatusContext is a cheap status lookup intended for high-frequency checks (e.g., auto-recover).
+//
+// It uses ListUnitsByPatterns (lightweight) for the core state, and only falls back to the
+// expensive property map when the unit is not active (to fetch down-since timestamps).
+//
+// Note: this intentionally does NOT populate Enabled/Memory/Uptime.
 func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
+	sm.mu.RLock()
+	conn := sm.conn
+	sm.mu.RUnlock()
+	if conn == nil {
+		return nil, fmt.Errorf("systemd connection is closed")
+	}
+
+	unitName := serviceName + ".service"
+
+	// Fast path: core state without pulling the full unit property map.
+	units, err := conn.ListUnitsByPatternsContext(ctx, nil, []string{unitName})
+	if err == nil && len(units) > 0 {
+		// Prefer exact match if patterns returned multiple.
+		u := units[0]
+		for _, x := range units {
+			if x.Name == unitName {
+				u = x
+				break
+			}
+		}
+		st := &ServiceStatus{
+			Name:        serviceName,
+			Active:      u.ActiveState,
+			SubState:    u.SubState,
+			LoadState:   u.LoadState,
+			Description: u.Description,
+		}
+		if st.LoadState == "not-found" || st.SubState == "not-found" {
+			st.Active = "unknown"
+			st.SubState = "not-found"
+			st.LoadState = "not-found"
+			return st, nil
+		}
+		// Healthy unit: no need for timestamps.
+		if st.Active == "active" {
+			return st, nil
+		}
+		// Down / transitioning: fetch a few timestamps used to compute "down since".
+		props, perr := conn.GetUnitPropertiesContext(ctx, unitName)
+		if perr == nil {
+			st.ActiveSince = parseTimestamp(props, "ActiveEnterTimestamp")
+			st.ActiveExit = parseTimestamp(props, "ActiveExitTimestamp")
+			st.InactiveSince = parseTimestamp(props, "InactiveEnterTimestamp")
+			st.StateChange = parseTimestamp(props, "StateChangeTimestamp")
+		}
+		return st, nil
+	}
+
+	// Fallback: property query (handles missing units or older backends).
+	props, err := conn.GetUnitPropertiesContext(ctx, unitName)
+	if err != nil {
+		if isNoSuchUnitErr(err) {
+			return &ServiceStatus{
+				Name:      serviceName,
+				Active:    "unknown",
+				SubState:  "not-found",
+				LoadState: "not-found",
+			}, nil
+		}
+		return nil, fmt.Errorf("failed to get status for %s: %w", serviceName, err)
+	}
+
+	activeState, _ := getStringProperty(props, "ActiveState")
+	subState, _ := getStringProperty(props, "SubState")
+	loadState, _ := getStringProperty(props, "LoadState")
+	description, _ := getStringProperty(props, "Description")
+
+	if loadState == "not-found" {
+		return &ServiceStatus{
+			Name:      serviceName,
+			Active:    "unknown",
+			SubState:  "not-found",
+			LoadState: "not-found",
+		}, nil
+	}
+
+	return &ServiceStatus{
+		Name:          serviceName,
+		Active:        activeState,
+		SubState:      subState,
+		LoadState:     loadState,
+		Description:   description,
+		ActiveSince:   parseTimestamp(props, "ActiveEnterTimestamp"),
+		ActiveExit:    parseTimestamp(props, "ActiveExitTimestamp"),
+		InactiveSince: parseTimestamp(props, "InactiveEnterTimestamp"),
+		StateChange:   parseTimestamp(props, "StateChangeTimestamp"),
+	}, nil
+}
+
+func (sm *ServiceManager) GetStatusFullContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
 	sm.mu.RLock()
 	conn := sm.conn
 	sm.mu.RUnlock()
@@ -520,7 +652,7 @@ func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName stri
 	return status, nil
 }
 
-// GetStatusLiteContext is a cheaper variant of GetStatusContext.
+// GetStatusLiteContext is a cheaper variant of GetStatusFullContext.
 // It only fetches core state + timestamps, skipping Enabled/Memory/Uptime.
 // Useful for high-frequency checks (e.g., auto-recover tick) to reduce load and
 // avoid retaining large allocations from repeated D-Bus calls.
@@ -596,7 +728,7 @@ func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceSta
 			svcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 			defer cancel()
 
-			status, err := sm.GetStatusContext(svcCtx, svc)
+			status, err := sm.GetStatusFullContext(svcCtx, svc)
 			if err != nil {
 				mu.Lock()
 				statuses = append(statuses, ServiceStatus{

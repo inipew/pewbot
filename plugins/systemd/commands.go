@@ -387,7 +387,7 @@ func (p *Plugin) cmdStatus(ctx context.Context, req *core.Request) error {
 			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"unit not allowed: "+u, nil)
 			return nil
 		}
-		st, err := mgr.GetStatusContext(ctx, u)
+		st, err := mgr.GetStatusFullContext(ctx, u)
 		if err != nil {
 			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"failed: "+err.Error(), nil)
 			return nil
@@ -404,7 +404,7 @@ func (p *Plugin) cmdStatus(ctx context.Context, req *core.Request) error {
 			lines = append(lines, u+": not allowed")
 			continue
 		}
-		st, err := mgr.GetStatusContext(ctx, u)
+		st, err := mgr.GetStatusFullContext(ctx, u)
 		if err != nil {
 			lines = append(lines, u+": error: "+err.Error())
 			continue

@@ -42,12 +42,6 @@ type serverTestResult struct {
 	Ping     time.Duration
 }
 
-// SpeedtestHistory stores all historical results
-type SpeedtestHistory struct {
-	Results []SpeedtestResult `json:"results"`
-	mu      sync.RWMutex
-}
-
 // DailyStats contains 24-hour statistics
 type DailyStats struct {
 	Period        string    `json:"period"`
@@ -69,8 +63,8 @@ type DailyStats struct {
 // Plugin implements speedtest functionality
 type Plugin struct {
 	pluginkit.EnhancedPluginBase
-	cfg      Config
-	history  *SpeedtestHistory
-	mu       sync.RWMutex
-	autoTask string // last scheduled short name
+	cfg       Config
+	historyMu sync.Mutex // serialize history_file access
+	mu        sync.RWMutex
+	autoTask  string // last scheduled short name
 }

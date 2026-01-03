@@ -64,6 +64,13 @@ func NewServiceManager(services []string) (*ServiceManager, error) {
 	sort.Strings(cp)
 	return &ServiceManager{services: cp}, nil
 }
+
+// SetEnabledCacheTTL updates the IsEnabled cache TTL (no-op on non-linux).
+func (sm *ServiceManager) SetEnabledCacheTTL(ttl time.Duration) {}
+
+// ClearEnabledCache clears cached IsEnabled results (no-op on non-linux).
+func (sm *ServiceManager) ClearEnabledCache() {}
+
 func (sm *ServiceManager) Close() error { return nil }
 
 func (sm *ServiceManager) GetManagedServices() []string {
@@ -133,6 +140,14 @@ func (sm *ServiceManager) IsEnabled(ctx context.Context, serviceName string) boo
 
 func (sm *ServiceManager) GetStatusContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
 	return &ServiceStatus{Name: serviceName, Active: "unknown", SubState: "unsupported", LoadState: "unsupported"}, nil
+}
+
+func (sm *ServiceManager) GetStatusFullContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
+	return sm.GetStatusContext(ctx, serviceName)
+}
+
+func (sm *ServiceManager) GetStatusLiteContext(ctx context.Context, serviceName string) (*ServiceStatus, error) {
+	return sm.GetStatusContext(ctx, serviceName)
 }
 func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceStatus, error) {
 	sm.mu.RLock()
