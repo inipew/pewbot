@@ -13,6 +13,7 @@ type Config struct {
 	RetryMaxDelay   time.Duration
 	DedupWindow     time.Duration
 	DedupMaxEntries int
+	PersistDedup    bool
 }
 
 type HistoryItem struct {

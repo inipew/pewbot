@@ -84,4 +84,9 @@ type Plugin struct {
 	historyMu sync.Mutex // serialize history_file access
 	mu        sync.RWMutex
 	autoTask  string // last scheduled short name
+
+	// runGate ensures speedtest runs (manual command + scheduled task) never overlap.
+	// It is a 1-token semaphore.
+	runGateOnce sync.Once
+	runGate     chan struct{}
 }

@@ -15,6 +15,8 @@ import (
 	"pewbot/internal/services/notify"
 	"pewbot/internal/services/pprof"
 	"pewbot/internal/services/scheduler"
+	"pewbot/internal/services/taskengine"
+	"pewbot/internal/storage"
 )
 
 type App struct {
@@ -23,15 +25,17 @@ type App struct {
 	cfgm *ConfigManager
 	sup  *Supervisor
 
-	log  *slog.Logger
-	logs *logging.Service
-	bus  eventbus.Bus
+	log   *slog.Logger
+	logs  *logging.Service
+	bus   eventbus.Bus
+	store storage.Store
 
 	adapter kit.Adapter
 
-	sched *scheduler.Service
-	notif *notify.Service
-	pprof *pprof.Service
+	engine *taskengine.Service
+	sched  *scheduler.Service
+	notif  *notify.Service
+	pprof  *pprof.Service
 
 	cmdm *CommandManager
 	pm   *PluginManager
@@ -87,11 +91,33 @@ func NewApp(cfgPath string) (*App, error) {
 
 	bus := eventbus.New()
 
+	// Storage (optional)
+	var store storage.Store
+	if sc, enabled, err := mapStorageConfig(cfg); err != nil {
+		return nil, err
+	} else if enabled {
+		st, err := storage.Open(sc, log.With(slog.String("comp", "storage")))
+		if err != nil {
+			return nil, err
+		}
+		store = st
+		log.Info("storage enabled", slog.String("driver", sc.Driver))
+	}
+
 	// Services mapping
 	defaultTimeout, err := parseDurationField("scheduler.default_timeout", cfg.Scheduler.DefaultTimeout)
 	if err != nil {
 		return nil, err
 	}
+
+	engineSvc := taskengine.New(taskengine.Config{
+		Enabled:        cfg.Scheduler.Enabled,
+		Workers:        cfg.Scheduler.Workers,
+		QueueSize:      256,
+		DefaultTimeout: defaultTimeout,
+		HistorySize:    cfg.Scheduler.HistorySize,
+		RetryMax:       cfg.Scheduler.RetryMax,
+	}, log.With(slog.String("comp", "taskengine")), bus)
 
 	schedSvc := scheduler.New(scheduler.Config{
 		Enabled:        cfg.Scheduler.Enabled,
@@ -100,13 +126,13 @@ func NewApp(cfgPath string) (*App, error) {
 		HistorySize:    cfg.Scheduler.HistorySize,
 		Timezone:       cfg.Scheduler.Timezone,
 		RetryMax:       cfg.Scheduler.RetryMax,
-	}, log.With(slog.String("comp", "scheduler")), bus)
+	}, engineSvc, log.With(slog.String("comp", "scheduler")), bus)
 
 	ncfg, err := mapNotifierConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
-	notifSvc := notify.New(ncfg, ad, log.With(slog.String("comp", "notifier")), bus)
+	notifSvc := notify.New(ncfg, ad, log.With(slog.String("comp", "notifier")), bus, store)
 
 	// pprof service mapping (optional)
 	pprofCfg, err := mapPprofConfig(cfg)
@@ -130,8 +156,11 @@ func NewApp(cfgPath string) (*App, error) {
 			Config:      cfgm,
 			Services:    serv,
 			Bus:         bus,
+			Store:       store,
 			OwnerUserID: cfg.Telegram.OwnerUserIDs,
 		}, cmdm)
+	// Expose plugin runtime state for operational commands.
+	serv.Plugins = pm
 
 	return &App{
 		cfgPath: cfgPath,
@@ -139,7 +168,9 @@ func NewApp(cfgPath string) (*App, error) {
 		log:     log,
 		logs:    logSvc,
 		bus:     bus,
+		store:   store,
 		adapter: ad,
+		engine:  engineSvc,
 		sched:   schedSvc,
 		notif:   notifSvc,
 		pprof:   pprofSvc,
@@ -202,6 +233,10 @@ func (a *App) Start(ctx context.Context) error {
 			if _, err := mapNotifierConfig(cfg); err != nil {
 				return err
 			}
+			// storage validation
+			if _, _, err := mapStorageConfig(cfg); err != nil {
+				return err
+			}
 			// per-plugin validation
 			if a.pm != nil {
 				return a.pm.ValidateConfig(c, cfg)
@@ -216,6 +251,9 @@ func (a *App) Start(ctx context.Context) error {
 
 	if a.notif != nil && a.notif.Enabled() {
 		a.notif.Start(a.sup.Context())
+	}
+	if a.engine != nil && a.engine.Enabled() {
+		a.engine.Start(a.sup.Context())
 	}
 	if a.sched.Enabled() {
 		a.sched.Start(a.sup.Context())
@@ -289,6 +327,13 @@ func (a *App) Start(ctx context.Context) error {
 				}
 				lastApplied = newCfg
 
+				for _, s := range sections {
+					if s == "storage" {
+						a.log.Warn("storage config changed; restart required for changes to take effect")
+						break
+					}
+				}
+
 				// apply logging updates
 				a.logs.Apply(logging.Config{
 					Level:   newCfg.Logging.Level,
@@ -319,12 +364,22 @@ func (a *App) Start(ctx context.Context) error {
 				a.cmdm.SetOwners(newCfg.Telegram.OwnerUserIDs)
 				a.pm.SetOwnerUserIDs(newCfg.Telegram.OwnerUserIDs)
 
-				// apply scheduler updates (live)
-				prevSchedEnabled := a.sched.Enabled()
+				// apply scheduler/taskengine updates (live)
+				prevEnabled := a.sched.Enabled()
 				newDefaultTimeout, err := parseDurationField("scheduler.default_timeout", newCfg.Scheduler.DefaultTimeout)
 				if err != nil {
 					a.log.Warn("invalid scheduler.default_timeout; using 0", slog.Any("err", err))
 					newDefaultTimeout = 0
+				}
+				if a.engine != nil {
+					a.engine.Apply(taskengine.Config{
+						Enabled:        newCfg.Scheduler.Enabled,
+						Workers:        newCfg.Scheduler.Workers,
+						QueueSize:      256,
+						DefaultTimeout: newDefaultTimeout,
+						HistorySize:    newCfg.Scheduler.HistorySize,
+						RetryMax:       newCfg.Scheduler.RetryMax,
+					})
 				}
 				a.sched.Apply(scheduler.Config{
 					Enabled:        newCfg.Scheduler.Enabled,
@@ -335,14 +390,20 @@ func (a *App) Start(ctx context.Context) error {
 					RetryMax:       newCfg.Scheduler.RetryMax,
 				})
 
-				// enable/disable services on the fly (was previously not handled)
-				if prevSchedEnabled && !newCfg.Scheduler.Enabled {
+				// enable/disable services on the fly
+				if prevEnabled && !newCfg.Scheduler.Enabled {
 					a.log.Info("scheduler disabled via config")
 					stopCtx, cancel := context.WithTimeout(c, 3*time.Second)
 					a.sched.Stop(stopCtx)
+					if a.engine != nil {
+						a.engine.Stop(stopCtx)
+					}
 					cancel()
-				} else if !prevSchedEnabled && newCfg.Scheduler.Enabled {
+				} else if !prevEnabled && newCfg.Scheduler.Enabled {
 					a.log.Info("scheduler enabled via config")
+					if a.engine != nil {
+						a.engine.Start(c)
+					}
 					a.sched.Start(c)
 				}
 
@@ -477,6 +538,12 @@ func (a *App) Stop(ctx context.Context, reason StopReason) error {
 
 	// Stop services (order: scheduler/notifier/adapter)
 	step("scheduler", 2*time.Second, func(c context.Context) error { a.sched.Stop(c); return nil })
+	step("taskengine", 2*time.Second, func(c context.Context) error {
+		if a.engine != nil {
+			a.engine.Stop(c)
+		}
+		return nil
+	})
 	step("pprof", 1*time.Second, func(c context.Context) error {
 		if a.pprof != nil {
 			a.pprof.Stop(c)
@@ -485,6 +552,12 @@ func (a *App) Stop(ctx context.Context, reason StopReason) error {
 	})
 	step("notifier", 1*time.Second, func(c context.Context) error { a.notif.Stop(c); return nil })
 	step("adapter", 2*time.Second, func(c context.Context) error { return a.adapter.Stop(c) })
+	step("storage", 1*time.Second, func(c context.Context) error {
+		if a.store != nil {
+			return a.store.Close()
+		}
+		return nil
+	})
 
 	// Finally, wait for supervised goroutines (config watch/reload, command dispatcher, etc.)
 	step("supervisor", 2*time.Second, func(c context.Context) error { return a.sup.Wait(c) })

@@ -54,7 +54,11 @@ func (p *Plugin) handleSpeedtest(ctx context.Context, req *core.Request) error {
 	_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+"Running speedtest, please wait...", nil)
 
 	// Run speedtest
-	result, msg, err := p.runSpeedtest(ctx)
+	result, msg, err := p.runSpeedtest(ctx, "command")
+	if err == ErrAlreadyRunning {
+		_, _ = req.Adapter.SendText(ctx, req.Chat, prefix+"Speedtest sedang berjalan, coba lagi sebentar lagi.", nil)
+		return nil
+	}
 	if err != nil {
 		errMsg := fmt.Sprintf("%sError: %v", prefix, err)
 		_, _ = req.Adapter.SendText(ctx, req.Chat, errMsg, nil)

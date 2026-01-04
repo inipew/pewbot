@@ -23,6 +23,7 @@ func mapNotifierConfig(cfg *Config) (notify.Config, error) {
 		RetryMaxDelay:   10 * time.Second,
 		DedupWindow:     1 * time.Minute,
 		DedupMaxEntries: 2000,
+		PersistDedup:    false,
 	}
 
 	if cfg == nil || cfg.Notifier == nil {
@@ -30,6 +31,7 @@ func mapNotifierConfig(cfg *Config) (notify.Config, error) {
 	}
 	n := cfg.Notifier
 	out.Enabled = n.Enabled
+	out.PersistDedup = n.PersistDedup
 	if n.Workers != 0 {
 		out.Workers = n.Workers
 	}
@@ -60,6 +62,7 @@ func mapNotifierConfig(cfg *Config) (notify.Config, error) {
 	if n.DedupMaxEntries != 0 {
 		out.DedupMaxEntries = n.DedupMaxEntries
 	}
+	out.PersistDedup = n.PersistDedup
 
 	// Bounds.
 	if out.Workers < 0 {

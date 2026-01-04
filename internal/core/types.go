@@ -11,6 +11,7 @@ type Config struct {
 	Pprof     PprofConfig                `json:"pprof,omitempty"`
 	Scheduler SchedulerConfig            `json:"scheduler"`
 	Notifier  *NotifierConfig            `json:"notifier,omitempty"`
+	Storage   *StorageConfig             `json:"storage,omitempty"`
 	Plugins   map[string]PluginConfigRaw `json:"plugins"`
 }
 
@@ -29,6 +30,18 @@ type NotifierConfig struct {
 	RetryMaxDelay   string `json:"retry_max_delay"`
 	DedupWindow     string `json:"dedup_window"`
 	DedupMaxEntries int    `json:"dedup_max_entries"`
+	PersistDedup    bool   `json:"persist_dedup,omitempty"`
+}
+
+// StorageConfig controls the optional persistence layer.
+//
+// Example:
+//
+//	"storage": { "driver": "file", "path": "./pewbot_store" }
+type StorageConfig struct {
+	Driver      string `json:"driver"`
+	Path        string `json:"path"`
+	BusyTimeout string `json:"busy_timeout,omitempty"` // Go duration string (sqlite)
 }
 
 // PprofConfig controls the optional pprof HTTP server.
@@ -92,6 +105,14 @@ type SchedulerConfig struct {
 }
 type PluginConfigRaw struct {
 	Enabled bool            `json:"enabled"`
+	// Allow is an optional capability allowlist for this plugin.
+	//
+	// Notes:
+	//   - This is NOT a security boundary (plugins are still in-process).
+	//   - It is an operational guardrail: core will wrap selected ports
+	//     (Scheduler/Notifier/Storage) and deny calls that don't match.
+	//   - If omitted or empty, all capabilities are allowed (backwards compatible).
+	Allow  []string        `json:"allow,omitempty"`
 	Config  json.RawMessage `json:"config,omitempty"`
 }
 
@@ -100,6 +121,7 @@ type PluginConfigRaw struct {
 func (p *PluginConfigRaw) UnmarshalJSON(b []byte) error {
 	type tmp struct {
 		Enabled bool            `json:"enabled"`
+		Allow   []string        `json:"allow,omitempty"`
 		Config  json.RawMessage `json:"config,omitempty"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
@@ -108,6 +130,6 @@ func (p *PluginConfigRaw) UnmarshalJSON(b []byte) error {
 	if err := dec.Decode(&t); err != nil {
 		return err
 	}
-	*p = PluginConfigRaw{Enabled: t.Enabled, Config: t.Config}
+	*p = PluginConfigRaw{Enabled: t.Enabled, Allow: t.Allow, Config: t.Config}
 	return nil
 }

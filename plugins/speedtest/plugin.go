@@ -135,7 +135,12 @@ func (p *Plugin) OnConfigChange(ctx context.Context, raw json.RawMessage) error 
 		Timeout(c.taskTimeout).
 		SkipIfRunning().
 		Do(func(ctx context.Context) error {
-			result, msg, err := p.runSpeedtest(ctx)
+			result, msg, err := p.runSpeedtest(ctx, "schedule")
+			if err == ErrAlreadyRunning {
+				// Avoid failing the scheduled task when a manual run is in progress.
+				p.PublishEvent("speedtest.schedule.skipped_running", map[string]any{"task": sc.TaskName})
+				return nil
+			}
 			if err != nil {
 				_ = p.Notify().Error("Speedtest failed: " + err.Error())
 				return err

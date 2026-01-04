@@ -8,9 +8,14 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"pewbot/internal/eventbus"
+	"pewbot/internal/services/taskengine"
 )
 
-// Config controls the scheduler service.
+// Config controls the scheduler (trigger) service.
+//
+// For backwards compatibility, this still contains execution-related fields
+// (Workers/DefaultTimeout/HistorySize/RetryMax), but execution is handled by
+// internal/services/taskengine.
 type Config struct {
 	Enabled        bool
 	Workers        int
@@ -20,73 +25,19 @@ type Config struct {
 	RetryMax       int    // max retries per task (default 3)
 }
 
-type OverlapPolicy int
+// Re-export execution types from taskengine.
+type OverlapPolicy = taskengine.OverlapPolicy
+
+type TaskOptions = taskengine.TaskOptions
+
+type HistoryItem = taskengine.HistoryItem
+
+type TaskEvent = taskengine.TaskEvent
 
 const (
-	OverlapAllow OverlapPolicy = iota
-	OverlapSkipIfRunning
+	OverlapAllow         = taskengine.OverlapAllow
+	OverlapSkipIfRunning = taskengine.OverlapSkipIfRunning
 )
-
-type TaskOptions struct {
-	Overlap       OverlapPolicy
-	RetryMax      int
-	RetryBase     time.Duration
-	RetryMaxDelay time.Duration
-	RetryJitter   float64 // 0.2 = 20%
-}
-
-func (o TaskOptions) withDefaults(cfg Config) TaskOptions {
-	// defaults from scheduler config
-	if o.RetryMax <= 0 {
-		o.RetryMax = cfg.RetryMax
-	}
-	if o.RetryBase <= 0 {
-		o.RetryBase = 500 * time.Millisecond
-	}
-	if o.RetryMaxDelay <= 0 {
-		o.RetryMaxDelay = 15 * time.Second
-	}
-	if o.RetryJitter <= 0 {
-		o.RetryJitter = 0.2
-	}
-	// default overlap: skip (safer)
-	if o.Overlap != OverlapAllow && o.Overlap != OverlapSkipIfRunning {
-		o.Overlap = OverlapSkipIfRunning
-	}
-	return o
-}
-
-type runState struct {
-	mu      sync.Mutex
-	running bool
-}
-
-type HistoryItem struct {
-	ID       string
-	Name     string
-	Started  time.Time
-	Duration time.Duration
-	Error    string
-}
-
-// TaskEvent is emitted on the event bus for task lifecycle events.
-type TaskEvent struct {
-	ID       string        `json:"id"`
-	Name     string        `json:"name"`
-	Started  time.Time     `json:"started"`
-	Duration time.Duration `json:"duration"`
-	Attempts int           `json:"attempts"`
-	Error    string        `json:"error,omitempty"`
-}
-
-type task struct {
-	id      string
-	name    string
-	timeout time.Duration
-	run     func(ctx context.Context) error
-	opt     TaskOptions
-	state   *runState
-}
 
 type scheduleDef struct {
 	id      string
@@ -96,7 +47,7 @@ type scheduleDef struct {
 	job     func(ctx context.Context) error
 	entryID cron.EntryID
 	opt     TaskOptions
-	state   *runState
+	state   *taskengine.RunState
 }
 
 type Service struct {
@@ -107,14 +58,11 @@ type Service struct {
 	loc *time.Location
 	bus eventbus.Bus
 
+	engine *taskengine.Service
+
 	parser cron.Parser
 	c      *cron.Cron
 	defs   []scheduleDef
-
-	queue  chan task
-	stopCh chan struct{}
-	// stopDone is non-nil while a Stop() is in progress; it is closed when workers fully exit.
-	stopDone chan struct{}
 
 	// one-time timers (timers are runtime; onceAt/onceTimeout are persistent definitions)
 	tmu         sync.Mutex
@@ -123,12 +71,6 @@ type Service struct {
 	onceTimeout map[string]time.Duration
 	onceJob     map[string]func(ctx context.Context) error
 	onceVer     map[string]uint64
-
-	hmu       sync.Mutex
-	history   []HistoryItem
-	runCtx    context.Context
-	runCancel context.CancelFunc
-	workerWG  sync.WaitGroup
 }
 
 type ScheduleInfo struct {
@@ -141,10 +83,19 @@ type ScheduleInfo struct {
 }
 
 type Snapshot struct {
-	Enabled   bool
-	Timezone  string
-	Workers   int
-	QueueLen  int
-	Schedules []ScheduleInfo
-	History   []HistoryItem
+	Enabled  bool
+	Timezone string
+
+	// Executor diagnostics (taskengine).
+	Workers        int
+	QueueLen       int
+	QueueCap       int
+	Dropped        uint64
+	DefaultTimeout time.Duration
+	RetryMax       int
+	RetryBase      time.Duration
+	RetryMaxDelay  time.Duration
+	RetryJitter    float64
+	Schedules      []ScheduleInfo
+	History        []HistoryItem
 }

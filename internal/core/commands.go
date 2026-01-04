@@ -69,6 +69,20 @@ type Request struct {
 type Services struct {
 	Scheduler SchedulerPort
 	Notifier  NotifierPort
+	Plugins   PluginsPort
+}
+
+// PluginsPort exposes read-only plugin runtime state for operational commands.
+//
+// Note: plugins are still in-process; this is not a security boundary.
+type PluginsPort interface {
+	// Snapshot returns the current plugin runtime state and the last known health
+	// result (if available).
+	Snapshot() PluginsSnapshot
+
+	// CheckHealth triggers an on-demand health check for the given plugins.
+	// If names is empty, it checks all running plugins that implement HealthChecker.
+	CheckHealth(ctx context.Context, names []string) []PluginHealthResult
 }
 
 type SchedulerPort interface {

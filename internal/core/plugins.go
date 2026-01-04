@@ -2,16 +2,28 @@ package core
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"time"
 
 	"pewbot/internal/eventbus"
 	"pewbot/internal/kit"
+	"pewbot/internal/storage"
 )
+
+type pluginEvent struct {
+	Plugin string `json:"plugin"`
+	Stage  string `json:"stage,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	Err    string `json:"err,omitempty"`
+	TookMS int64  `json:"took_ms,omitempty"`
+	Count  int    `json:"count,omitempty"`
+}
 
 type Plugin interface {
 	Name() string
@@ -35,6 +47,7 @@ type PluginDeps struct {
 	Config      *ConfigManager
 	Services    *Services
 	Bus         eventbus.Bus
+	Store       storage.Store
 	OwnerUserID []int64
 }
 
@@ -66,7 +79,41 @@ type PluginManager struct {
 	// Most commonly this is triggered by invalid standardized timeouts.
 	quarantine map[string]quarantineState
 
+	// per-plugin capability allowlist (mutable for hot reload)
+	caps map[string]*capRef
+
+	// health loops started for running plugins implementing HealthChecker
+	healthStarted map[string]bool
+	// last known health result per plugin (updated by periodic loop and on-demand checks)
+	healthLast map[string]PluginHealthResult
+
 	cmdm *CommandManager
+}
+
+// HealthChecker is an optional plugin interface.
+// If implemented, core will periodically call Health() and publish an event.
+type HealthChecker interface {
+	Health(ctx context.Context) (status string, err error)
+}
+
+// HealthLoopOptIn is an optional marker interface.
+//
+// By default, the plugin manager will NOT start a periodic health loop even if a
+// plugin implements HealthChecker. Plugins must explicitly opt-in to avoid
+// creating background loops for simple plugins.
+//
+// This is especially important because many plugins embed PluginBase, which may
+// provide a trivial Health() implementation for convenience.
+type HealthLoopOptIn interface {
+	HealthLoopEnabled() bool
+}
+
+// SupervisorProvider is an optional interface implemented by plugins embedding
+// core.PluginBase (directly or via pluginkit.EnhancedPluginBase).
+// It allows the plugin manager to attach internal goroutines (like health loops)
+// to the plugin's supervisor so they are owned + joinable.
+type SupervisorProvider interface {
+	Supervisor() *Supervisor
 }
 
 type quarantineState struct {
@@ -91,8 +138,145 @@ func NewPluginManager(log *slog.Logger, cfgm *ConfigManager, deps PluginDeps, cm
 		pctx:           map[string]context.Context{},
 		pcancel:        map[string]context.CancelFunc{},
 		quarantine:     map[string]quarantineState{},
+		caps:           map[string]*capRef{},
+		healthStarted:  map[string]bool{},
+		healthLast:     map[string]PluginHealthResult{},
 		cmdm:           cmdm,
 	}
+}
+
+func (pm *PluginManager) emit(typ string, data pluginEvent) {
+	bus := pm.deps.Bus
+	if bus == nil {
+		return
+	}
+	bus.Publish(eventbus.Event{Type: typ, Data: data})
+}
+
+func (pm *PluginManager) capsFor(name string) *capRef {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.caps[name]
+}
+
+func (pm *PluginManager) ensureCaps(name string, allow []string) *capRef {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	cr := pm.caps[name]
+	if cr == nil {
+		cr = newCapRef(allow)
+		pm.caps[name] = cr
+		return cr
+	}
+	cr.Update(allow)
+	return cr
+}
+
+func (pm *PluginManager) deleteCapsLocked(name string) {
+	delete(pm.caps, name)
+	delete(pm.healthStarted, name)
+}
+
+func (pm *PluginManager) depsForPlugin(name string, raw PluginConfigRaw) PluginDeps {
+	// Create a per-plugin allowlist ref and wrap selected ports.
+	cr := pm.ensureCaps(name, raw.Allow)
+	d := pm.deps
+	d.Services = wrapServicesForPlugin(pm.deps.Services, cr)
+	d.Store = wrapStoreForPlugin(pm.deps.Store, cr)
+	return d
+}
+
+func (pm *PluginManager) startHealthLoop(name string, p Plugin, hc HealthChecker, pluginCtx context.Context) {
+	if hc == nil {
+		return
+	}
+
+	// Require explicit opt-in to avoid spawning health loops for every plugin
+	// that happens to implement HealthChecker (e.g. by embedding PluginBase).
+	if oi, ok := p.(HealthLoopOptIn); !ok || !oi.HealthLoopEnabled() {
+		return
+	}
+
+	pm.mu.Lock()
+	if pm.healthStarted[name] {
+		pm.mu.Unlock()
+		return
+	}
+	pm.healthStarted[name] = true
+	pm.mu.Unlock()
+
+	const (
+		interval   = 30 * time.Second
+		timeout    = 3 * time.Second
+		failThresh = 3
+	)
+
+	pm.log.Debug("plugin health loop started", slog.String("plugin", name))
+	pm.emit("plugin.health.loop_started", pluginEvent{Plugin: name})
+
+	loop := func(ctx context.Context) {
+		defer func() {
+			pm.log.Debug("plugin health loop stopped", slog.String("plugin", name))
+			pm.emit("plugin.health.loop_stopped", pluginEvent{Plugin: name})
+		}()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		fails := 0
+
+		run := func() {
+			hctx, cancel := context.WithTimeout(ctx, timeout)
+			status, err := hc.Health(hctx)
+			cancel()
+			at := time.Now()
+			if err != nil {
+				fails++
+				pm.mu.Lock()
+				pm.healthLast[name] = PluginHealthResult{Plugin: name, At: at, Status: status, Err: err.Error(), Fails: fails}
+				pm.mu.Unlock()
+				pm.emit("plugin.health", pluginEvent{Plugin: name, Stage: status, Err: err.Error(), Count: fails})
+				if fails == failThresh {
+					pm.log.Warn("plugin health failing repeatedly", slog.String("plugin", name), slog.Int("fails", fails), slog.String("err", err.Error()))
+					pm.emit("plugin.unhealthy", pluginEvent{Plugin: name, Err: err.Error(), Count: fails})
+				}
+				return
+			}
+			if fails > 0 {
+				pm.emit("plugin.recovered", pluginEvent{Plugin: name, Stage: status, Count: fails})
+				fails = 0
+			}
+			pm.mu.Lock()
+			pm.healthLast[name] = PluginHealthResult{Plugin: name, At: at, Status: status}
+			pm.mu.Unlock()
+			pm.emit("plugin.health", pluginEvent{Plugin: name, Stage: status})
+		}
+
+		// initial check
+		run()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				run()
+			}
+		}
+	}
+
+	// Prefer attaching to the plugin supervisor so the goroutine becomes owned + joinable.
+	if sp, ok := p.(SupervisorProvider); ok {
+		if sup := sp.Supervisor(); sup != nil {
+			sup.Go0("health.loop", loop)
+			return
+		}
+	}
+
+	// Fallback: run on a raw goroutine bound to pluginCtx.
+	// For opt-in plugins we expect SupervisorProvider to be available.
+	if pluginCtx == nil {
+		pluginCtx = context.Background()
+	}
+	go loop(pluginCtx)
 }
 
 func (pm *PluginManager) isQuarantined(name string, rawHash uint64) bool {
@@ -109,6 +293,7 @@ func (pm *PluginManager) clearQuarantineOnChange(name string, rawHash uint64) {
 		delete(pm.quarantine, name)
 		pm.mu.Unlock()
 		pm.log.Info("plugin quarantine cleared (config changed)", slog.String("plugin", name))
+		pm.emit("plugin.quarantine_cleared", pluginEvent{Plugin: name})
 		return
 	}
 	pm.mu.Unlock()
@@ -136,6 +321,7 @@ func (pm *PluginManager) setQuarantine(name string, rawHash uint64, err error, s
 	pm.mu.Unlock()
 
 	pm.log.Error("plugin quarantined", slog.String("plugin", name), slog.String("stage", stage), slog.String("err", errStr))
+	pm.emit("plugin.quarantined", pluginEvent{Plugin: name, Stage: stage, Err: errStr, Count: count})
 }
 
 // globalDepsHash captures a small, conservative subset of config that plugins might implicitly depend on.
@@ -261,16 +447,20 @@ func (pm *PluginManager) stopOne(stopCtx context.Context, name string, reason St
 		// ok
 	case <-stopCtx.Done():
 		pm.log.Warn("plugin stop timeout (continuing)", slog.String("plugin", name), slog.String("err", stopCtx.Err().Error()))
+		pm.emit("plugin.stop_timeout", pluginEvent{Plugin: name, Reason: string(reason), Err: stopCtx.Err().Error()})
 	}
 
 	pm.mu.Lock()
 	pm.run[name] = false
+	pm.healthLast[name] = PluginHealthResult{Plugin: name, At: time.Now(), Status: "stopped"}
 	delete(pm.pctx, name)
 	delete(pm.pcancel, name)
 	delete(pm.lastRawHash, name)
+	pm.deleteCapsLocked(name)
 	pm.mu.Unlock()
 
 	took := time.Since(start)
+	pm.emit("plugin.stopped", pluginEvent{Plugin: name, Reason: string(reason), TookMS: took.Milliseconds()})
 	if took >= 500*time.Millisecond {
 		pm.log.Info("plugin stopped", slog.String("plugin", name), slog.String("reason", string(reason)), slog.Duration("took", took), slog.Bool("ctx_was_set", pctx != nil))
 	} else {
@@ -300,7 +490,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 		raw, ok := cfg.Plugins[name]
 		enabled := ok && raw.Enabled
 		running := pm.run[name]
-		rh := canonicalHashJSON(raw.Config)
+		rh := effectivePluginHash(raw)
 		ops = append(ops, op{name: name, p: p, raw: raw, rawHash: rh, enabled: enabled, run: running})
 	}
 	pm.mu.Unlock()
@@ -323,16 +513,20 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			}
 
 			pm.log.Debug("plugin enable requested", slog.String("plugin", o.name))
+			pm.emit("plugin.enable_requested", pluginEvent{Plugin: o.name})
+
 			// start: create LONG-LIVED plugin ctx from internal base ctx
 			pctx, cancel := context.WithCancel(pm.baseCtx)
+			deps := pm.depsForPlugin(o.name, o.raw)
 
 			// init (bounded by timeout ctx)
 			{
 				ictx, icancel := context.WithTimeout(pctx, callTimeout)
-				err := pm.safeCall("plugin.init."+o.name, func() error { return o.p.Init(ictx, pm.deps) })
+				err := pm.safeCall("plugin.init."+o.name, func() error { return o.p.Init(ictx, deps) })
 				icancel()
 				if err != nil {
 					pm.log.Error("plugin init failed", slog.String("plugin", o.name), slog.Any("err", err))
+					pm.emit("plugin.init_failed", pluginEvent{Plugin: o.name, Err: err.Error()})
 					cancel()
 					continue
 				}
@@ -344,6 +538,7 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 				if err := v.ValidateConfig(cctx, o.raw.Config); err != nil {
 					ccancel()
 					pm.setQuarantine(o.name, o.rawHash, fmt.Errorf("config validate: %w", err), "validate")
+					pm.emit("plugin.config_invalid", pluginEvent{Plugin: o.name, Err: err.Error()})
 					cancel()
 					continue
 				}
@@ -356,14 +551,17 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 				ccancel()
 				if err != nil {
 					pm.setQuarantine(o.name, o.rawHash, fmt.Errorf("config apply: %w", err), "config")
+					pm.emit("plugin.config_failed", pluginEvent{Plugin: o.name, Err: err.Error()})
 					cancel()
 					continue
 				}
+				pm.emit("plugin.config_applied", pluginEvent{Plugin: o.name})
 			}
 
 			// Start should receive pctx (long-lived). We enforce timeout externally.
 			if err := pm.startWithTimeout(o.name, o.p, pctx, cancel, callTimeout); err != nil {
 				pm.log.Error("plugin start failed", slog.String("plugin", o.name), slog.Any("err", err))
+				pm.emit("plugin.start_failed", pluginEvent{Plugin: o.name, Err: err.Error()})
 				cancel()
 				continue
 			}
@@ -377,14 +575,21 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 			pm.mu.Unlock()
 
 			pm.log.Info("plugin started", slog.String("plugin", o.name))
+			pm.emit("plugin.started", pluginEvent{Plugin: o.name})
+			if hc, ok := o.p.(HealthChecker); ok {
+				pm.startHealthLoop(o.name, o.p, hc, pctx)
+			}
 
 		case !o.enabled && o.run:
 			pm.log.Debug("plugin disable requested", slog.String("plugin", o.name))
+			pm.emit("plugin.disable_requested", pluginEvent{Plugin: o.name})
 			stopCtx, cancel := context.WithTimeout(pm.baseCtx, callTimeout)
 			pm.stopOne(stopCtx, o.name, StopPluginDisable)
 			cancel()
 		case o.enabled && o.run:
 			if cp, ok := o.p.(ConfigurablePlugin); ok {
+				// Update capability allowlist even if config blob itself didn't change.
+				pm.ensureCaps(o.name, o.raw.Allow)
 				newHash := o.rawHash
 				pm.mu.Lock()
 				oldHash := pm.lastRawHash[o.name]
@@ -417,11 +622,13 @@ func (pm *PluginManager) reconcile(cfg *Config) error {
 				ccancel()
 				if err != nil {
 					pm.setQuarantine(o.name, newHash, fmt.Errorf("config apply: %w", err), "config")
+					pm.emit("plugin.config_failed", pluginEvent{Plugin: o.name, Err: err.Error()})
 					stopCtx, cancel := context.WithTimeout(pm.baseCtx, callTimeout)
 					pm.stopOne(stopCtx, o.name, StopPluginQuarantine)
 					cancel()
 					break
 				}
+				pm.emit("plugin.config_applied", pluginEvent{Plugin: o.name})
 				pm.mu.Lock()
 				pm.lastRawHash[o.name] = newHash
 				delete(pm.quarantine, o.name)
@@ -675,6 +882,135 @@ func (pm *PluginManager) DebugStatus() string {
 	return out
 }
 
+// Snapshot implements PluginsPort.
+func (pm *PluginManager) Snapshot() PluginsSnapshot {
+	cfg := pm.cfgm.Get()
+	pm.mu.Lock()
+	names := make([]string, 0, len(pm.reg))
+	for name := range pm.reg {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := PluginsSnapshot{Time: time.Now(), Plugins: make([]PluginStatus, 0, len(names))}
+	for _, name := range names {
+		p := pm.reg[name]
+		running := pm.run[name]
+		hasHealth := false
+		if p != nil {
+			_, hasHealth = p.(HealthChecker)
+		}
+		enabled := false
+		hasCfg := false
+		if cfg != nil && cfg.Plugins != nil {
+			if r, ok := cfg.Plugins[name]; ok {
+				enabled = r.Enabled
+				hasCfg = true
+			}
+		}
+		q, qok := pm.quarantine[name]
+		last := pm.healthLast[name]
+		out.Plugins = append(out.Plugins, PluginStatus{
+			Name:             name,
+			Enabled:          enabled,
+			Running:          running,
+			HasConfig:        hasCfg,
+			Quarantined:      qok,
+			QuarantineErr:    q.err,
+			QuarantineSince:  q.since,
+			HasHealthChecker: hasHealth,
+			HealthLoopActive: pm.healthStarted[name],
+			LastHealth:       last,
+		})
+	}
+	pm.mu.Unlock()
+	return out
+}
+
+// CheckHealth implements PluginsPort.
+func (pm *PluginManager) CheckHealth(ctx context.Context, names []string) []PluginHealthResult {
+	const perPluginTimeout = 3 * time.Second
+
+	// Determine targets without holding lock during plugin calls.
+	type target struct {
+		name    string
+		p       Plugin
+		hc      HealthChecker
+		running bool
+	}
+
+	pm.mu.Lock()
+	var targets []target
+	if len(names) > 0 {
+		for _, name := range names {
+			p := pm.reg[name]
+			if p == nil {
+				continue
+			}
+			hc, _ := p.(HealthChecker)
+			targets = append(targets, target{name: name, p: p, hc: hc, running: pm.run[name]})
+		}
+	} else {
+		for name, p := range pm.reg {
+			hc, ok := p.(HealthChecker)
+			if !ok {
+				continue
+			}
+			if !pm.run[name] {
+				continue
+			}
+			targets = append(targets, target{name: name, p: p, hc: hc, running: true})
+		}
+	}
+	pm.mu.Unlock()
+
+	sort.Slice(targets, func(i, j int) bool { return targets[i].name < targets[j].name })
+
+	results := make([]PluginHealthResult, 0, len(targets))
+	for _, t := range targets {
+		at := time.Now()
+		// If not running or no health checker, just record a synthetic state.
+		if !t.running || t.hc == nil {
+			r := PluginHealthResult{Plugin: t.name, At: at, Status: "stopped"}
+			pm.mu.Lock()
+			pm.healthLast[t.name] = r
+			pm.mu.Unlock()
+			results = append(results, r)
+			continue
+		}
+
+		base := pm.ctxOr(context.Background(), t.name)
+		hctx, cancel := context.WithTimeout(base, perPluginTimeout)
+		// Also respect the caller context (command), without changing the base owner context.
+		// context.AfterFunc returns a stop func with signature func() bool.
+		stop := func() bool { return false }
+		if ctx != nil {
+			stop = context.AfterFunc(ctx, cancel)
+		}
+		status, err := t.hc.Health(hctx)
+		_ = stop()
+		cancel()
+
+		pm.mu.Lock()
+		prev := pm.healthLast[t.name]
+		fails := prev.Fails
+		r := PluginHealthResult{Plugin: t.name, At: at, Status: status}
+		if err != nil {
+			fails++
+			r.Err = err.Error()
+			r.Fails = fails
+		} else {
+			fails = 0
+			r.Fails = 0
+		}
+		pm.healthLast[t.name] = r
+		pm.mu.Unlock()
+
+		results = append(results, r)
+	}
+
+	return results
+}
+
 func mustDuration(s string, def time.Duration) time.Duration {
 	if s == "" {
 		return def
@@ -684,4 +1020,19 @@ func mustDuration(s string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func effectivePluginHash(raw PluginConfigRaw) uint64 {
+	// Hash config (canonical JSON) + allowlist (order-insensitive).
+	ch := canonicalHashJSON(raw.Config)
+
+	allow := append([]string(nil), raw.Allow...)
+	sort.Strings(allow)
+	ab, _ := json.Marshal(allow)
+	ah := hashBytes(ab)
+
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:8], ch)
+	binary.LittleEndian.PutUint64(buf[8:16], ah)
+	return hashBytes(buf[:])
 }

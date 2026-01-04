@@ -41,6 +41,10 @@
     "history_size": 200,
     "timezone": "Asia/Jakarta"
   },
+  "storage": {
+    "driver": "file",
+    "path": "./pewbot_store"
+  },
   "notifier": {
     "enabled": true,
     "workers": 2,
@@ -50,7 +54,8 @@
     "retry_base": "500ms",
     "retry_max_delay": "10s",
     "dedup_window": "1m",
-    "dedup_max_entries": 2000
+    "dedup_max_entries": 2000,
+    "persist_dedup": false
   },
   "plugins": {
     "echo": {
@@ -67,6 +72,7 @@
     },
     "systemd": {
       "enabled": true,
+      "allow": ["notify.send", "scheduler.write", "storage.audit"],
       "config": {
         "prefix": "svc: ",
         "allow_units": [

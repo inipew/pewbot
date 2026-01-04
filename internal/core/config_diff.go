@@ -96,6 +96,7 @@ func SummarizeConfigChange(oldCfg, newCfg *Config) ([]string, []slog.Attr, []str
 		RetryMaxDelay:   "10s",
 		DedupWindow:     "1m",
 		DedupMaxEntries: 2000,
+		PersistDedup:    false,
 	}
 	oldN := oldCfg.Notifier
 	newN := newCfg.Notifier
@@ -113,6 +114,32 @@ func SummarizeConfigChange(oldCfg, newCfg *Config) ([]string, []slog.Attr, []str
 			slog.Int("notifier.queue_size", newN.QueueSize),
 			slog.Int("notifier.rate_per_sec", newN.RatePerSec),
 			slog.Int("notifier.retry_max", newN.RetryMax),
+			slog.Bool("notifier.persist_dedup", newN.PersistDedup),
+		)
+	}
+
+	// Storage (persistence)
+	oldS := oldCfg.Storage
+	newS := newCfg.Storage
+	// Nil means disabled.
+	var oDriver, nDriver, oBusy, nBusy string
+	var oPathSet, nPathSet bool
+	if oldS != nil {
+		oDriver = strings.TrimSpace(oldS.Driver)
+		oBusy = strings.TrimSpace(oldS.BusyTimeout)
+		oPathSet = strings.TrimSpace(oldS.Path) != ""
+	}
+	if newS != nil {
+		nDriver = strings.TrimSpace(newS.Driver)
+		nBusy = strings.TrimSpace(newS.BusyTimeout)
+		nPathSet = strings.TrimSpace(newS.Path) != ""
+	}
+	if oDriver != nDriver || oBusy != nBusy || oPathSet != nPathSet {
+		changed = append(changed, "storage")
+		attrs = append(attrs,
+			slog.String("storage.driver", nDriver),
+			slog.Bool("storage.path_set", nPathSet),
+			slog.String("storage.busy_timeout", nBusy),
 		)
 	}
 

@@ -2,21 +2,21 @@ package scheduler
 
 import (
 	"time"
+
+	"pewbot/internal/services/taskengine"
 )
 
 func (s *Service) Snapshot() Snapshot {
 	s.mu.Lock()
 	enabled := s.cfg.Enabled
 	tz := s.cfg.Timezone
-	workers := s.cfg.Workers
-	ql := 0
-	if s.queue != nil {
-		ql = len(s.queue)
-	}
+	defTimeout := s.cfg.DefaultTimeout
+	retryMax := s.cfg.RetryMax
 	defs := make([]scheduleDef, len(s.defs))
 	copy(defs, s.defs)
 	c := s.c
 	loc := s.loc
+	eng := s.engine
 	s.mu.Unlock()
 
 	if loc == nil {
@@ -37,17 +37,36 @@ func (s *Service) Snapshot() Snapshot {
 		items = append(items, it)
 	}
 
-	s.hmu.Lock()
-	hist := make([]HistoryItem, len(s.history))
-	copy(hist, s.history)
-	s.hmu.Unlock()
+	workers := 0
+	ql := 0
+	qc := 0
+	dropped := uint64(0)
+	hist := []HistoryItem{}
+	if eng != nil {
+		es := eng.Snapshot()
+		workers = es.Workers
+		ql = es.QueueLen
+		qc = es.QueueCap
+		dropped = es.Dropped
+		hist = es.History
+	}
+
+	// Surface effective retry defaults used by the executor.
+	opt := taskengine.DefaultTaskOptions(taskengine.Config{RetryMax: retryMax})
 
 	return Snapshot{
-		Enabled:   enabled,
-		Timezone:  tz,
-		Workers:   workers,
-		QueueLen:  ql,
-		Schedules: items,
-		History:   hist,
+		Enabled:        enabled,
+		Timezone:       tz,
+		Workers:        workers,
+		QueueLen:       ql,
+		QueueCap:       qc,
+		Dropped:        dropped,
+		DefaultTimeout: defTimeout,
+		RetryMax:       opt.RetryMax,
+		RetryBase:      opt.RetryBase,
+		RetryMaxDelay:  opt.RetryMaxDelay,
+		RetryJitter:    opt.RetryJitter,
+		Schedules:      items,
+		History:        hist,
 	}
 }

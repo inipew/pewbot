@@ -2,9 +2,12 @@ package speedtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
+	"net/http"
 	"runtime"
 	"sort"
 	"sync"
@@ -13,17 +16,68 @@ import (
 	"github.com/showwin/speedtest-go/speedtest"
 )
 
+type idleConnCloser interface {
+	CloseIdleConnections()
+}
+
 type pingResult struct {
 	Server *speedtest.Server
 	Err    error
 }
 
-func (p *Plugin) runSpeedtest(ctx context.Context) (*SpeedtestResult, string, error) {
+var ErrAlreadyRunning = errors.New("speedtest already running")
+
+func (p *Plugin) runSpeedtest(ctx context.Context, source string) (*SpeedtestResult, string, error) {
+	// Global run gate: prevent overlap between manual command and scheduled task.
+	p.runGateOnce.Do(func() {
+		p.runGate = make(chan struct{}, 1)
+		p.runGate <- struct{}{}
+	})
+	select {
+	case <-p.runGate:
+		// acquired
+	default:
+		p.PublishEvent("speedtest.skipped_running", map[string]any{"source": source})
+		return nil, "", ErrAlreadyRunning
+	}
+	defer func() { p.runGate <- struct{}{} }()
+	startGate := time.Now()
+	p.PublishEvent("speedtest.run.started", map[string]any{"source": source})
+	defer func() {
+		p.PublishEvent("speedtest.run.finished", map[string]any{"source": source, "held_ms": time.Since(startGate).Milliseconds()})
+	}()
+
 	cfg := p.getConfig()
 	start := time.Now()
 
-	ctx, cancel := context.WithTimeout(ctx, cfg.operationTimeout)
+	// Bind this run to the plugin lifecycle so any internal goroutines exit on plugin stop.
+	//
+	// - Base context: plugin runtime context (canceled on disable/stop)
+	// - Also cancel when the *caller* ctx ends (command/task timeout)
+	// - And enforce an operation timeout
+	callerCtx := ctx
+	base := callerCtx
+	if pctx := p.Context(); pctx != nil {
+		base = pctx
+	}
+	opCtx, cancel := context.WithTimeout(base, cfg.operationTimeout)
+	stopCallerCancel := context.AfterFunc(callerCtx, cancel)
+	defer stopCallerCancel()
 	defer cancel()
+	ctx = opCtx
+
+	// Use a dedicated HTTP transport for speedtest, then close idle connections
+	// when the run finishes. This reduces the chance of lingering net/http
+	// persistConn goroutines across runs.
+	hc, tr := newSpeedtestHTTPClient(cfg)
+	defer func() {
+		if tr != nil {
+			tr.CloseIdleConnections()
+		}
+		// Also close idles on the default transport (some library paths may still
+		// fall back to it).
+		closeIdleConnections(http.DefaultTransport)
+	}()
 
 	// IMPORTANT:
 	// Don't use package-level speedtest.Fetch* helpers. speedtest-go keeps a
@@ -33,6 +87,8 @@ func (p *Plugin) runSpeedtest(ctx context.Context) (*SpeedtestResult, string, er
 		SavingMode:     cfg.SavingMode,
 		MaxConnections: cfg.MaxConnections,
 	}))
+	// Best-effort: if the library exposes a way to set a custom client, use it.
+	applyHTTPClient(st, hc)
 	// Be extra defensive: some speedtest-go paths use the manager thread count.
 	if cfg.MaxConnections > 0 {
 		st.SetNThread(cfg.MaxConnections)
@@ -203,10 +259,21 @@ func (p *Plugin) pingCandidates(ctx context.Context, servers []*speedtest.Server
 	out := make(chan pingResult, len(servers))
 	var wg sync.WaitGroup
 
-	for _, s := range servers {
+	launch := func(name string, fn func()) {
+		// Prefer the plugin supervisor so goroutines are owned (panic-safe + stop-bounded).
+		if p.Runner != nil {
+			p.Runner.Go0(name, func(_ context.Context) { fn() })
+			return
+		}
+		// Fallback: no supervisor (shouldn't happen in normal runtime). Run inline.
+		fn()
+	}
+
+	for i, s := range servers {
 		s := s
+		idx := i
 		wg.Add(1)
-		go func() {
+		launch(fmt.Sprintf("speedtest.ping.%d", idx), func() {
 			defer wg.Done()
 
 			select {
@@ -220,13 +287,11 @@ func (p *Plugin) pingCandidates(ctx context.Context, servers []*speedtest.Server
 			// PingTestContext sets s.Latency / s.Jitter.
 			err := s.PingTestContext(ctx, nil)
 			out <- pingResult{Server: s, Err: err}
-		}()
+		})
 	}
 
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
+	wg.Wait()
+	close(out)
 
 	pinged := make([]*speedtest.Server, 0, len(servers))
 	for r := range out {
@@ -256,6 +321,78 @@ func (p *Plugin) packetLoss(ctx context.Context, host string) float64 {
 	}
 	// LossPercent is already in 0..100.
 	return pl.LossPercent()
+}
+
+func newSpeedtestHTTPClient(cfg Config) (*http.Client, *http.Transport) {
+	// Keep the dial timeout reasonably short; the overall operation is already
+	// bounded by cfg.operationTimeout.
+	dialTimeout := 10 * time.Second
+	if cfg.operationTimeout > 0 {
+		// Cap dial timeout to half of the operation timeout so we fail fast.
+		capTo := cfg.operationTimeout / 2
+		if capTo < dialTimeout {
+			dialTimeout = capTo
+		}
+		if dialTimeout < 2*time.Second {
+			dialTimeout = 2 * time.Second
+		}
+	}
+
+	perHost := cfg.MaxConnections
+	if perHost <= 0 {
+		perHost = 4
+	}
+	if perHost < 2 {
+		perHost = 2
+	}
+
+	d := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           d.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   perHost,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	hc := &http.Client{Transport: tr}
+	return hc, tr
+}
+
+func closeIdleConnections(rt http.RoundTripper) {
+	if rt == nil {
+		return
+	}
+	if c, ok := rt.(idleConnCloser); ok {
+		c.CloseIdleConnections()
+	}
+}
+
+// applyHTTPClient tries to configure a custom http.Client on the speedtest
+// instance, if the library exposes any compatible setter.
+//
+// This is best-effort and intentionally reflection-free so it stays stable
+// across speedtest-go versions.
+func applyHTTPClient(st any, hc *http.Client) {
+	if st == nil || hc == nil {
+		return
+	}
+	// Common method names across Go libs.
+	if s, ok := st.(interface{ SetHTTPClient(*http.Client) }); ok {
+		s.SetHTTPClient(hc)
+		return
+	}
+	if s, ok := st.(interface{ SetHttpClient(*http.Client) }); ok {
+		s.SetHttpClient(hc)
+		return
+	}
+	if s, ok := st.(interface{ SetClient(*http.Client) }); ok {
+		s.SetClient(hc)
+		return
+	}
 }
 
 // calculateAverage computes average metrics across successful results.

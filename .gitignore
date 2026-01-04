@@ -3,3 +3,5 @@ config.json
 pewbot*.zip
 pewbot
 pprof*.zip
+goroutines.txt
+*.pprof

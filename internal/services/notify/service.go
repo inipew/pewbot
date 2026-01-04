@@ -13,6 +13,7 @@ import (
 
 	"pewbot/internal/eventbus"
 	"pewbot/internal/kit"
+	"pewbot/internal/storage"
 
 	"golang.org/x/time/rate"
 )
@@ -39,6 +40,7 @@ type Service struct {
 	log     *slog.Logger
 	adapter kit.Adapter
 	bus     eventbus.Bus
+	store   storage.Store
 
 	cfg     Config
 	limiter *rate.Limiter
@@ -57,16 +59,25 @@ type Service struct {
 	dmu   sync.Mutex
 	dedup map[string]time.Time
 
+	// Optional persistent dedup writes (best-effort)
+	persistCh chan dedupWrite
+
 	// In-memory history (for /status)
 	hmu     sync.Mutex
 	history []HistoryItem
 }
 
-func New(cfg Config, adapter kit.Adapter, log *slog.Logger, bus eventbus.Bus) *Service {
+type dedupWrite struct {
+	key   string
+	until time.Time
+}
+
+func New(cfg Config, adapter kit.Adapter, log *slog.Logger, bus eventbus.Bus, store storage.Store) *Service {
 	s := &Service{
 		adapter: adapter,
 		log:     log,
 		bus:     bus,
+		store:   store,
 		dedup:   map[string]time.Time{},
 	}
 	s.applyLocked(cfg)
@@ -135,7 +146,24 @@ func (s *Service) Start(ctx context.Context) {
 	s.stopDone = make(chan struct{})
 	s.runCtx, s.runCancel = context.WithCancel(ctx)
 	workers := s.cfg.Workers
+	// Optional persistent dedup writes.
+	if s.cfg.PersistDedup && s.store != nil {
+		s.persistCh = make(chan dedupWrite, 1024)
+	}
 	s.mu.Unlock()
+
+	if s.persistCh != nil {
+		s.workerWG.Add(1)
+		go func() {
+			defer s.workerWG.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					s.log.Error("panic in notifier dedup persist", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+				}
+			}()
+			s.persistLoop()
+		}()
+	}
 
 	for i := 0; i < workers; i++ {
 		i := i
@@ -156,6 +184,7 @@ func (s *Service) Start(ctx context.Context) {
 func (s *Service) Stop(ctx context.Context) {
 	s.mu.Lock()
 	q := s.queue
+	pch := s.persistCh
 	done := s.stopDone
 	cancel := s.runCancel
 	if q == nil {
@@ -182,6 +211,12 @@ func (s *Service) Stop(ctx context.Context) {
 	}
 
 	// Now it's safe to close the queue.
+	if pch != nil {
+		func() {
+			defer func() { _ = recover() }()
+			close(pch)
+		}()
+	}
 	func() {
 		defer func() { _ = recover() }()
 		close(q)
@@ -206,6 +241,7 @@ func (s *Service) Stop(ctx context.Context) {
 
 	s.mu.Lock()
 	s.queue = nil
+	s.persistCh = nil
 	s.stopDone = nil
 	s.runCancel = nil
 	s.runCtx = nil
@@ -234,6 +270,9 @@ func (s *Service) Notify(ctx context.Context, n kit.Notification) error {
 	// Capture current config snapshot for dedup computation.
 	dedupWindow := s.cfg.DedupWindow
 	dedupMax := s.cfg.DedupMaxEntries
+	persistDedup := s.cfg.PersistDedup
+	st := s.store
+	pch := s.persistCh
 	s.sendWG.Add(1)
 	s.mu.Unlock()
 	defer s.sendWG.Done()
@@ -241,7 +280,7 @@ func (s *Service) Notify(ctx context.Context, n kit.Notification) error {
 	// Build dedup key and apply suppression.
 	key := dedupKey(n)
 	if dedupWindow > 0 && key != "" {
-		if !s.dedupAllow(key, dedupWindow, dedupMax) {
+		if !s.dedupAllow(ctx, key, dedupWindow, dedupMax, persistDedup, st, pch) {
 			if s.bus != nil {
 				now := time.Now()
 				s.bus.Publish(eventbus.Event{Type: "notify.deduped", Time: now, Data: NotificationEvent{Channel: n.Channel, ChatID: n.Target.ChatID, ThreadID: n.Target.ThreadID, Key: key, At: now}})
@@ -281,6 +320,26 @@ func (s *Service) appendHistory(text string) {
 		s.history = s.history[len(s.history)-300:]
 	}
 	s.hmu.Unlock()
+}
+
+func (s *Service) persistLoop() {
+	s.mu.Lock()
+	ch := s.persistCh
+	st := s.store
+	runCtx := s.runCtx
+	s.mu.Unlock()
+	if ch == nil || st == nil {
+		return
+	}
+	for w := range ch {
+		pctx := runCtx
+		if pctx == nil {
+			pctx = context.Background()
+		}
+		cctx, cancel := context.WithTimeout(pctx, 250*time.Millisecond)
+		_ = st.PutDedup(cctx, w.key, w.until)
+		cancel()
+	}
 }
 
 func (s *Service) workerLoop(idx int) {
@@ -415,18 +474,41 @@ func dedupKey(n kit.Notification) string {
 	return fmt.Sprintf("%x", h.Sum64())
 }
 
-func (s *Service) dedupAllow(key string, window time.Duration, max int) bool {
+func (s *Service) dedupAllow(ctx context.Context, key string, window time.Duration, max int, persist bool, st storage.Store, pch chan dedupWrite) bool {
 	now := time.Now()
 
+	// 1) In-memory check.
 	s.dmu.Lock()
-	defer s.dmu.Unlock()
 	if s.dedup == nil {
 		s.dedup = map[string]time.Time{}
 	}
 	if until, ok := s.dedup[key]; ok && now.Before(until) {
+		s.dmu.Unlock()
 		return false
 	}
-	s.dedup[key] = now.Add(window)
+	s.dmu.Unlock()
+
+	// 2) Persistent check (best-effort) for cross-restart dedup.
+	if persist && st != nil {
+		qctx := ctx
+		if qctx == nil {
+			qctx = context.Background()
+		}
+		cctx, cancel := context.WithTimeout(qctx, 25*time.Millisecond)
+		until, ok, err := st.GetDedup(cctx, key)
+		cancel()
+		if err == nil && ok && now.Before(until) {
+			s.dmu.Lock()
+			s.dedup[key] = until
+			s.dmu.Unlock()
+			return false
+		}
+	}
+
+	// 3) Allow and set new window.
+	until := now.Add(window)
+	s.dmu.Lock()
+	s.dedup[key] = until
 
 	// Prune expired and cap.
 	if len(s.dedup) > 0 {
@@ -453,6 +535,15 @@ func (s *Service) dedupAllow(key string, window time.Duration, max int) bool {
 				break
 			}
 			delete(s.dedup, minKey)
+		}
+	}
+	s.dmu.Unlock()
+
+	// 4) Persist new suppress-until asynchronously (best-effort).
+	if persist && st != nil && pch != nil {
+		select {
+		case pch <- dedupWrite{key: key, until: until}:
+		default:
 		}
 	}
 	return true

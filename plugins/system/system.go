@@ -44,7 +44,6 @@ func (p *Plugin) Commands() []core.Command {
 	return []core.Command{
 		{
 			Route:       "ping",
-			Aliases:     []string{"health"},
 			Description: "cek kesehatan bot",
 			Usage:       "/ping",
 			Access:      core.AccessEveryone,
@@ -52,6 +51,14 @@ func (p *Plugin) Commands() []core.Command {
 				_, _ = req.Adapter.SendText(ctx, req.Chat, "pong", nil)
 				return nil
 			},
+		},
+		{
+			Route:       "health",
+			Aliases:     []string{"status"},
+			Description: "cek health bot (plugin/services)",
+			Usage:       "/health [check]",
+			Access:      core.AccessOwnerOnly,
+			Handle:      p.cmdHealth,
 		},
 		{
 			Route:       "uptime",
@@ -136,7 +143,24 @@ func (p *Plugin) cmdSchedList(ctx context.Context, req *core.Request) error {
 	now := time.Now()
 	lines := make([]string, 0, len(snap.Schedules)+3)
 	lines = append(lines, "⏱ scheduled tasks ("+snap.Timezone+"):")
-	lines = append(lines, fmt.Sprintf("- workers: %d, queue: %d", snap.Workers, snap.QueueLen))
+	queueStr := fmt.Sprintf("%d", snap.QueueLen)
+	if snap.QueueCap > 0 {
+		queueStr = fmt.Sprintf("%d/%d", snap.QueueLen, snap.QueueCap)
+	}
+	lines = append(lines, fmt.Sprintf("- workers: %d, queue: %s", snap.Workers, queueStr))
+
+	// Show effective executor defaults to avoid confusion when per-task timeout = 0.
+	if snap.DefaultTimeout > 0 {
+		lines = append(lines, fmt.Sprintf("- default timeout: %s (applies when task timeout=0)", snap.DefaultTimeout))
+	} else {
+		lines = append(lines, "- default timeout: disabled (task timeout=0 means no timeout)")
+	}
+	if snap.RetryMax > 0 {
+		lines = append(lines, fmt.Sprintf("- retry: max=%d, base=%s, max_delay=%s, jitter=%.0f%%",
+			snap.RetryMax, snap.RetryBase, snap.RetryMaxDelay, snap.RetryJitter*100))
+	} else {
+		lines = append(lines, "- retry: disabled (max=0)")
+	}
 
 	for _, t := range snap.Schedules {
 		next := "-"
@@ -147,8 +171,13 @@ func (p *Plugin) cmdSchedList(ctx context.Context, req *core.Request) error {
 			}
 		}
 		timeout := "-"
-		if t.Timeout > 0 {
+		switch {
+		case t.Timeout > 0:
 			timeout = t.Timeout.String()
+		case snap.DefaultTimeout > 0:
+			timeout = "default(" + snap.DefaultTimeout.String() + ")"
+		default:
+			timeout = "none"
 		}
 		lines = append(lines, fmt.Sprintf("- %s: spec=%s, next=%s, timeout=%s", t.Name, t.Spec, next, timeout))
 	}

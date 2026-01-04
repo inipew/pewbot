@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
+	"pewbot/internal/services/taskengine"
+
 	"github.com/robfig/cron/v3"
-	"pewbot/internal/eventbus"
 )
 
 // AddSchedule parses schedule and registers either a cron or interval task.
@@ -52,15 +54,14 @@ func (s *Service) AddCronOpt(name, spec string, timeout time.Duration, opt TaskO
 	// across hot-reloads or repeated registrations.
 	_ = s.removeScheduleLocked(name)
 	id := fmt.Sprintf("cron:%d", time.Now().UnixNano())
-	opt = opt.withDefaults(s.cfg)
 	d := scheduleDef{
 		id:      id,
 		name:    name,
 		spec:    spec,
-		timeout: s.resolveTimeout(timeout),
+		timeout: timeout,
 		job:     job,
 		opt:     opt,
-		state:   &runState{},
+		state:   &taskengine.RunState{},
 	}
 	s.defs = append(s.defs, d)
 	if s.c != nil {
@@ -94,15 +95,14 @@ func (s *Service) AddIntervalOpt(name string, every time.Duration, timeout time.
 	_ = s.removeScheduleLocked(name)
 	id := fmt.Sprintf("interval:%d", time.Now().UnixNano())
 	spec := fmt.Sprintf("@every %s", every.String())
-	opt = opt.withDefaults(s.cfg)
 	d := scheduleDef{
 		id:      id,
 		name:    name,
 		spec:    spec,
-		timeout: s.resolveTimeout(timeout),
+		timeout: timeout,
 		job:     job,
 		opt:     opt,
-		state:   &runState{},
+		state:   &taskengine.RunState{},
 	}
 	s.defs = append(s.defs, d)
 	if s.c != nil {
@@ -132,19 +132,14 @@ func (s *Service) AddOnce(name string, at time.Time, timeout time.Duration, job 
 		return "", errors.New("at required")
 	}
 
-	// snapshot location + default timeout config under s.mu
+	// snapshot location under s.mu
 	s.mu.Lock()
 	loc := s.loc
-	cfg := s.cfg
 	s.mu.Unlock()
 	if loc == nil {
 		loc = time.Local
 	}
 	runAt := at.In(loc)
-	resolved := timeout
-	if resolved <= 0 && cfg.DefaultTimeout > 0 {
-		resolved = cfg.DefaultTimeout
-	}
 
 	localName := name
 	localAt := runAt
@@ -160,7 +155,7 @@ func (s *Service) AddOnce(name string, at time.Time, timeout time.Duration, job 
 	s.onceVer[localName] = ver
 
 	s.onceAt[localName] = localAt
-	s.onceTimeout[localName] = resolved
+	s.onceTimeout[localName] = timeout
 	s.onceJob[localName] = job
 
 	delay := time.Until(localAt)
@@ -187,18 +182,16 @@ func (s *Service) AddOnce(name string, at time.Time, timeout time.Duration, job 
 		delete(s.onceVer, localName)
 		s.tmu.Unlock()
 
-		// enqueue task
-		s.mu.Lock()
-		cfgNow := s.cfg
-		s.mu.Unlock()
-		s.enqueue(task{
-			id:      fmt.Sprintf("once:%d", time.Now().UnixNano()),
-			name:    localName,
-			timeout: timeoutNow,
-			run:     jobNow,
-			opt:     TaskOptions{}.withDefaults(cfgNow),
-			state:   &runState{},
-		})
+		if s.engine != nil {
+			_ = s.engine.Enqueue(taskengine.Task{
+				ID:      fmt.Sprintf("once:%d", time.Now().UnixNano()),
+				Name:    localName,
+				Timeout: timeoutNow,
+				Run:     jobNow,
+				Opt:     TaskOptions{},
+				State:   &taskengine.RunState{},
+			})
+		}
 	})
 	s.timers[localName] = timer
 	s.tmu.Unlock()
@@ -306,20 +299,17 @@ func (s *Service) removeScheduleLocked(name string) bool {
 
 func (s *Service) addCronLocked(d *scheduleDef) error {
 	eid, err := s.c.AddFunc(d.spec, func() {
-		if d.opt.Overlap == OverlapSkipIfRunning {
-			d.state.mu.Lock()
-			running := d.state.running
-			d.state.mu.Unlock()
-			if running {
-				s.log.Debug("schedule skipped (previous run still running)", slog.String("task", d.name))
-				if s.bus != nil {
-					now := time.Now()
-					s.bus.Publish(eventbus.Event{Type: "task.skipped", Time: now, Data: TaskEvent{ID: d.id, Name: d.name, Started: now, Attempts: 0, Error: "overlap_skip"}})
-				}
-				return
-			}
+		if s.engine == nil {
+			return
 		}
-		s.enqueue(task{id: d.id, name: d.name, timeout: d.timeout, run: d.job, opt: d.opt, state: d.state})
+		_ = s.engine.Enqueue(taskengine.Task{
+			ID:      d.id,
+			Name:    d.name,
+			Timeout: d.timeout,
+			Run:     d.job,
+			Opt:     d.opt,
+			State:   d.state,
+		})
 	})
 	if err == nil {
 		d.entryID = eid
@@ -392,17 +382,16 @@ func (s *Service) rebuildOnceTimersLocked() {
 			delete(s.onceVer, localName)
 			s.tmu.Unlock()
 
-			s.mu.Lock()
-			cfgNow := s.cfg
-			s.mu.Unlock()
-			s.enqueue(task{
-				id:      fmt.Sprintf("once:%d", time.Now().UnixNano()),
-				name:    localName,
-				timeout: timeoutNow,
-				run:     jobNow,
-				opt:     TaskOptions{}.withDefaults(cfgNow),
-				state:   &runState{},
-			})
+			if s.engine != nil {
+				_ = s.engine.Enqueue(taskengine.Task{
+					ID:      fmt.Sprintf("once:%d", time.Now().UnixNano()),
+					Name:    localName,
+					Timeout: timeoutNow,
+					Run:     jobNow,
+					Opt:     TaskOptions{},
+					State:   &taskengine.RunState{},
+				})
+			}
 		})
 		s.timers[localName] = tmr
 	}
@@ -419,16 +408,6 @@ func (s *Service) loadLocationLocked() *time.Location {
 		return time.Local
 	}
 	return loc
-}
-
-func (s *Service) resolveTimeout(t time.Duration) time.Duration {
-	if t > 0 {
-		return t
-	}
-	if s.cfg.DefaultTimeout > 0 {
-		return s.cfg.DefaultTimeout
-	}
-	return 0
 }
 
 // previewNextRunsLocked returns a short, human-friendly list of upcoming run times
@@ -465,4 +444,21 @@ func (s *Service) previewNextRunsLocked(spec string, n int) string {
 		b.WriteString(t.Format("2006-01-02 15:04:05"))
 	}
 	return b.String()
+}
+
+func parseHHMM(s string) (hour int, minute int, err error) {
+	s = strings.TrimSpace(s)
+	parts := strings.Split(s, ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid time %q, expected HH:MM", s)
+	}
+	h, err := strconv.Atoi(parts[0])
+	if err != nil || h < 0 || h > 23 {
+		return 0, 0, fmt.Errorf("invalid hour in %q", s)
+	}
+	m, err := strconv.Atoi(parts[1])
+	if err != nil || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("invalid minute in %q", s)
+	}
+	return h, m, nil
 }

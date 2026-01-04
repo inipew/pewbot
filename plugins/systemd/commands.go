@@ -2,6 +2,7 @@ package systemd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -10,8 +11,15 @@ import (
 
 	"pewbot/internal/core"
 	"pewbot/internal/kit"
+	"pewbot/internal/storage"
 	sm "pewbot/pkg/systemdmanager"
 )
+
+type opRes struct {
+	Unit    string `json:"unit"`
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
 
 func (p *Plugin) Commands() []core.Command {
 	return []core.Command{
@@ -265,6 +273,7 @@ func (p *Plugin) cmdInactive(ctx context.Context, req *core.Request) error {
 }
 
 func (p *Plugin) cmdOperate(ctx context.Context, req *core.Request, action string, args []string) error {
+	start := time.Now()
 	mgr := p.mgrSnapshot()
 	cfg := p.cfgSnapshot()
 
@@ -285,37 +294,55 @@ func (p *Plugin) cmdOperate(ctx context.Context, req *core.Request, action strin
 		}
 	}
 
+	results := make([]opRes, 0, len(units))
+
+	// Execute
 	if len(units) == 1 {
 		u := units[0]
 		switch action {
 		case "start":
 			res := mgr.StartWithResult(ctx, u)
+			results = append(results, opRes{Unit: res.ServiceName, Success: res.Success, Error: errStr(res.Error)})
 			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+res.Message, nil)
 		case "stop":
 			res := mgr.StopWithResult(ctx, u)
+			results = append(results, opRes{Unit: res.ServiceName, Success: res.Success, Error: errStr(res.Error)})
 			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+res.Message, nil)
 		case "restart":
 			res := mgr.RestartWithResult(ctx, u)
+			results = append(results, opRes{Unit: res.ServiceName, Success: res.Success, Error: errStr(res.Error)})
 			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+res.Message, nil)
 		case "enable":
-			err := mgr.EnableContext(ctx, u)
-			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+plainOp("enable", u, err), nil)
+			e := mgr.EnableContext(ctx, u)
+			results = append(results, opRes{Unit: u, Success: e == nil, Error: errStr(e)})
+			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+plainOp("enable", u, e), nil)
 		case "disable":
-			err := mgr.DisableContext(ctx, u)
-			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+plainOp("disable", u, err), nil)
+			e := mgr.DisableContext(ctx, u)
+			results = append(results, opRes{Unit: u, Success: e == nil, Error: errStr(e)})
+			_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+plainOp("disable", u, e), nil)
 		}
+		p.auditOperate(ctx, req, action, units, results, time.Since(start))
 		return nil
 	}
 
 	// multi ops
-	var br sm.BatchResult
 	switch action {
-	case "start":
-		br = mgr.BatchStart(ctx, units)
-	case "stop":
-		br = mgr.BatchStop(ctx, units)
-	case "restart":
-		br = mgr.BatchRestart(ctx, units)
+	case "start", "stop", "restart":
+		var br sm.BatchResult
+		if action == "start" {
+			br = mgr.BatchStart(ctx, units)
+		} else if action == "stop" {
+			br = mgr.BatchStop(ctx, units)
+		} else {
+			br = mgr.BatchRestart(ctx, units)
+		}
+		lines := make([]string, 0, len(br.Results)+1)
+		lines = append(lines, fmt.Sprintf("%s batch: ok=%d fail=%d total=%d", action, br.SuccessCount, br.FailureCount, br.Total))
+		for _, r := range br.Results {
+			results = append(results, opRes{Unit: r.ServiceName, Success: r.Success, Error: errStr(r.Error)})
+			lines = append(lines, r.Message)
+		}
+		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+strings.Join(lines, "\n"), nil)
 	default:
 		// enable/disable batch: sequential for safety
 		ok := 0
@@ -330,20 +357,63 @@ func (p *Plugin) cmdOperate(ctx context.Context, req *core.Request, action strin
 			if e == nil {
 				ok++
 			}
+			results = append(results, opRes{Unit: u, Success: e == nil, Error: errStr(e)})
 			out = append(out, plainOp(action, u, e))
 		}
 		msg := fmt.Sprintf("%s batch: ok=%d fail=%d\n%s", action, ok, len(units)-ok, strings.Join(out, "\n"))
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+msg, nil)
-		return nil
 	}
 
-	lines := make([]string, 0, len(br.Results)+1)
-	lines = append(lines, fmt.Sprintf("%s batch: ok=%d fail=%d total=%d", action, br.SuccessCount, br.FailureCount, br.Total))
-	for _, r := range br.Results {
-		lines = append(lines, r.Message)
-	}
-	_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+strings.Join(lines, "\n"), nil)
+	p.auditOperate(ctx, req, action, units, results, time.Since(start))
 	return nil
+}
+
+func (p *Plugin) auditOperate(ctx context.Context, req *core.Request, action string, units []string, results []opRes, took time.Duration) {
+	// Best-effort audit only (storage may be disabled)
+	a := storage.AuditEntry{
+		At:       time.Now(),
+		ActorID:  req.FromID,
+		ChatID:   req.Chat.ChatID,
+		ThreadID: req.Chat.ThreadID,
+		Plugin:   "systemd",
+		Action:   "systemd." + action,
+		Target:   strings.Join(units, ","),
+		TookMS:   took.Milliseconds(),
+	}
+	// Username (best-effort)
+	if req.Update.Message != nil {
+		a.ActorUsername = req.Update.Message.FromUsername
+	}
+	// Summarize ok/fail + errors + meta
+	for _, r := range results {
+		if r.Success {
+			a.OK++
+		} else {
+			a.Fail++
+			if a.Error == "" && r.Error != "" {
+				a.Error = r.Error
+			}
+		}
+	}
+	meta := map[string]any{"units": units, "action": action, "cmd": req.Command, "args": req.Args, "results": results}
+	if b, err := json.Marshal(meta); err == nil {
+		a.MetaJSON = string(b)
+	}
+
+	auditCtx := ctx
+	if auditCtx == nil {
+		auditCtx = context.Background()
+	}
+	cctx, cancel := context.WithTimeout(auditCtx, 1*time.Second)
+	defer cancel()
+	_ = p.AppendAudit(cctx, a)
+}
+
+func errStr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (p *Plugin) cmdStatus(ctx context.Context, req *core.Request) error {

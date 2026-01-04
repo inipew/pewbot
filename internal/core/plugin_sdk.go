@@ -9,6 +9,7 @@ import (
 
 	"pewbot/internal/eventbus"
 	"pewbot/internal/kit"
+	"pewbot/internal/storage"
 )
 
 // ConfigValidator is an optional hook to validate plugin config before applying it.
@@ -30,6 +31,30 @@ type PluginBase struct {
 	pluginName string
 
 	ctx context.Context
+}
+
+// Supervisor returns the per-plugin supervisor, if StartBase has been called.
+// This lets the core attach additional plugin-scoped goroutines (e.g. health loops)
+// so they become owned + joinable under StopBase.
+func (b *PluginBase) Supervisor() *Supervisor { return b.Runner }
+
+// Health implements core.HealthChecker for any plugin embedding PluginBase.
+//
+// It is intentionally lightweight and should never block.
+// If a plugin needs richer health reporting, it can override Health().
+func (b *PluginBase) Health(ctx context.Context) (string, error) {
+	if b == nil {
+		return "nil", errors.New("plugin base is nil")
+	}
+	if b.ctx == nil {
+		return "not_started", nil
+	}
+	select {
+	case <-b.ctx.Done():
+		return "stopped", b.ctx.Err()
+	default:
+	}
+	return "ok", nil
 }
 
 // InitBase wires deps + logger.
@@ -111,6 +136,19 @@ func (b *PluginBase) Info(chatID int64, text string) error {
 		Text:     text,
 	}
 	return b.Notify(cctx, n)
+}
+
+// AppendAudit writes an audit entry to the configured storage (if present).
+// Plugins should treat this as best-effort; if storage is disabled, an error is returned.
+func (b *PluginBase) AppendAudit(ctx context.Context, e storage.AuditEntry) error {
+	if b == nil {
+		return errors.New("plugin is nil")
+	}
+	st := b.Deps.Store
+	if st == nil {
+		return errors.New("storage not available")
+	}
+	return st.AppendAudit(ctx, e)
 }
 
 // PublishEvent publishes a lightweight event to the in-process event bus (if present).
