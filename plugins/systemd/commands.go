@@ -21,6 +21,32 @@ type opRes struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// opCtx binds a command/callback context to the plugin lifecycle context.
+//
+// This ensures in-flight systemd operations are cancelled when the plugin is
+// disabled/stopped, while still respecting per-command timeouts (reqCtx).
+// Implemented without spawning an extra goroutine (uses context.AfterFunc).
+func (p *Plugin) opCtx(reqCtx context.Context) (context.Context, context.CancelFunc) {
+	plug := p.Context()
+	if plug == nil {
+		if reqCtx == nil {
+			return context.WithCancel(context.Background())
+		}
+		return context.WithCancel(reqCtx)
+	}
+	if reqCtx == nil {
+		return context.WithCancel(plug)
+	}
+	cctx, cancel := context.WithCancel(plug)
+	stop := context.AfterFunc(reqCtx, func() {
+		cancel()
+	})
+	return cctx, func() {
+		_ = stop()
+		cancel()
+	}
+}
+
 func (p *Plugin) Commands() []core.Command {
 	return []core.Command{
 		{
@@ -212,6 +238,8 @@ func (p *Plugin) cmdHelp(ctx context.Context, req *core.Request) error {
 func (p *Plugin) cmdList(ctx context.Context, req *core.Request) error {
 	mgr := p.mgrSnapshot()
 	cfg := p.cfgSnapshot()
+	ctx, cancel := p.opCtx(ctx)
+	defer cancel()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -231,6 +259,8 @@ func (p *Plugin) cmdList(ctx context.Context, req *core.Request) error {
 func (p *Plugin) cmdFailed(ctx context.Context, req *core.Request) error {
 	mgr := p.mgrSnapshot()
 	cfg := p.cfgSnapshot()
+	ctx, cancel := p.opCtx(ctx)
+	defer cancel()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -253,6 +283,8 @@ func (p *Plugin) cmdFailed(ctx context.Context, req *core.Request) error {
 func (p *Plugin) cmdInactive(ctx context.Context, req *core.Request) error {
 	mgr := p.mgrSnapshot()
 	cfg := p.cfgSnapshot()
+	ctx, cancel := p.opCtx(ctx)
+	defer cancel()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -276,6 +308,8 @@ func (p *Plugin) cmdOperate(ctx context.Context, req *core.Request, action strin
 	start := time.Now()
 	mgr := p.mgrSnapshot()
 	cfg := p.cfgSnapshot()
+	ctx, cancel := p.opCtx(ctx)
+	defer cancel()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)
@@ -419,6 +453,8 @@ func errStr(err error) string {
 func (p *Plugin) cmdStatus(ctx context.Context, req *core.Request) error {
 	mgr := p.mgrSnapshot()
 	cfg := p.cfgSnapshot()
+	ctx, cancel := p.opCtx(ctx)
+	defer cancel()
 
 	if mgr == nil {
 		_, _ = req.Adapter.SendText(ctx, req.Chat, cfg.Prefix+"systemd manager not available (non-linux/dbus permission?)", nil)

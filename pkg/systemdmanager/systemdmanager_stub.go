@@ -59,6 +59,11 @@ type ServiceManager struct {
 	services []string
 }
 
+func NewServiceManagerContext(ctx context.Context, services []string) (*ServiceManager, error) {
+	_ = ctx
+	return NewServiceManager(services)
+}
+
 func NewServiceManager(services []string) (*ServiceManager, error) {
 	cp := append([]string(nil), services...)
 	sort.Strings(cp)

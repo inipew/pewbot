@@ -175,7 +175,7 @@ func (p *Plugin) ensureManager(allow []string) {
 		p.closeManager()
 	}
 
-	mgr, err := sm.NewServiceManager(allow)
+	mgr, err := sm.NewServiceManagerContext(p.Context(), allow)
 	if err != nil {
 		p.Log.Warn("failed to create systemd manager", "err", err)
 		return

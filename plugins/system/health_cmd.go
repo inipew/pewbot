@@ -38,170 +38,134 @@ func (p *Plugin) cmdHealth(ctx context.Context, req *core.Request) error {
 		cancel()
 	}
 
-	snap := ps.Plugins.Snapshot()
+	plSnap := ps.Plugins.Snapshot()
 
-	// Basic runtime info.
+	// Runtime info.
 	up := time.Since(p.startedAt)
+	gos := runtime.NumGoroutine()
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
-	// Use plain text (no Markdown) to avoid Telegram parse failures.
-	// This command is operational; reliability beats fancy formatting.
-
-	loaded := len(snap.Plugins)
-	enabledN := 0
-	runningN := 0
-	quarantinedN := 0
-	unhealthyN := 0
-	for _, st := range snap.Plugins {
-		if st.Enabled {
-			enabledN++
-		}
-		if st.Running {
-			runningN++
-		}
-		if st.Quarantined {
-			quarantinedN++
-		}
-		if st.Enabled && st.Running && st.HasHealthChecker && st.LastHealth.Err != "" {
-			unhealthyN++
-		}
-	}
-
-	status := "Running"
-	if quarantinedN > 0 || unhealthyN > 0 {
-		status = "Degraded"
-	}
-
-	// Scheduler summary (if available).
-	schedEnabled := false
+	// Scheduler state + per-plugin schedule counts.
+	schedState := "disabled"
 	schedWorkers := 0
 	schedQueue := "-"
-	schedDropped := uint64(0)
-	schedCount := 0
-	defTimeout := time.Duration(0)
-	retryLine := "disabled"
-	if ps.Scheduler != nil && ps.Scheduler.Enabled() {
+	totalSchedules := 0
+	unscopedSchedules := 0
+	perPluginSchedules := map[string]int{}
+	if ps.Scheduler != nil {
 		s := ps.Scheduler.Snapshot()
-		schedEnabled = true
+		if ps.Scheduler.Enabled() {
+			schedState = "enabled"
+		}
 		schedWorkers = s.Workers
-		schedDropped = s.Dropped
-		schedCount = len(s.Schedules)
-		defTimeout = s.DefaultTimeout
-		schedQueue = fmt.Sprintf("%d", s.QueueLen)
 		if s.QueueCap > 0 {
 			schedQueue = fmt.Sprintf("%d/%d", s.QueueLen, s.QueueCap)
+		} else {
+			schedQueue = fmt.Sprintf("%d", s.QueueLen)
 		}
-		if s.RetryMax > 0 {
-			retryLine = fmt.Sprintf("max=%d, base=%s, max_delay=%s, jitter=%.0f%%", s.RetryMax, s.RetryBase, s.RetryMaxDelay, s.RetryJitter*100)
+		totalSchedules = len(s.Schedules)
+		for _, t := range s.Schedules {
+			name := t.Name
+			if i := strings.IndexByte(name, ':'); i > 0 {
+				perPluginSchedules[name[:i]]++
+			} else {
+				unscopedSchedules++
+			}
 		}
 	}
 
-	admins := "-"
-	if len(req.OwnerUserID) > 0 {
-		parts := make([]string, 0, len(req.OwnerUserID))
-		for _, id := range req.OwnerUserID {
-			parts = append(parts, fmt.Sprintf("%d", id))
-		}
-		admins = strings.Join(parts, ", ")
+	// Supervisor counters.
+	appSupLine := "app:   n/a"
+	if ps.AppSupervisor != nil {
+		c := ps.AppSupervisor.Counters()
+		appSupLine = fmt.Sprintf("app:   active=%d started=%d", c.Active, c.Started)
+	}
+	plSupLine := "plugin: n/a"
+	if sup := p.Supervisor(); sup != nil {
+		c := sup.Counters()
+		plSupLine = fmt.Sprintf("plugin(%s): active=%d started=%d", p.Name(), c.Active, c.Started)
 	}
 
 	// Render.
+	// Use plain text (no Markdown) to avoid Telegram parse failures.
 	var b strings.Builder
-	b.Grow(2048)
+	b.Grow(4096)
 
-	// Header
-	b.WriteString("🏥 Bot Health Status\n")
+	b.WriteString("🏥 /health\n")
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
-	b.WriteString(fmt.Sprintf("Status: %s\n", status))
-	b.WriteString(fmt.Sprintf("Uptime: %s\n", durRel(up)))
-	b.WriteString(fmt.Sprintf("Admin ID: %s\n", admins))
-	b.WriteString(fmt.Sprintf("Plugins: %d loaded (%d enabled, %d running", loaded, enabledN, runningN))
-	if quarantinedN > 0 {
-		b.WriteString(fmt.Sprintf(", %d quarantined", quarantinedN))
-	}
-	b.WriteString(")\n")
-	b.WriteString(fmt.Sprintf("Scheduled Tasks: %d\n", schedCount))
+	b.WriteString(fmt.Sprintf("uptime: %s\n", durRel(up)))
+	b.WriteString(fmt.Sprintf("goroutines: %d\n", gos))
 	b.WriteString("\n")
 
-	// Memory
-	b.WriteString("💾 Memory Usage\n")
-	b.WriteString(fmt.Sprintf("  • Allocated: %s\n", fmtBytes(m.Alloc)))
-	b.WriteString(fmt.Sprintf("  • System:    %s\n", fmtBytes(m.Sys)))
-	b.WriteString(fmt.Sprintf("  • Heap Inuse: %s\n", fmtBytes(m.HeapInuse)))
-	b.WriteString(fmt.Sprintf("  • GC Runs:   %d\n", m.NumGC))
+	b.WriteString("💾 mem\n")
+	b.WriteString(fmt.Sprintf("  Alloc:     %s\n", fmtBytes(m.Alloc)))
+	b.WriteString(fmt.Sprintf("  Sys:       %s\n", fmtBytes(m.Sys)))
+	b.WriteString(fmt.Sprintf("  HeapAlloc: %s\n", fmtBytes(m.HeapAlloc)))
+	b.WriteString(fmt.Sprintf("  HeapInuse: %s\n", fmtBytes(m.HeapInuse)))
+	b.WriteString(fmt.Sprintf("  NumGC:     %d\n", m.NumGC))
 	b.WriteString("\n")
 
-	// Runtime
-	b.WriteString("🤖 Runtime\n")
-	b.WriteString(fmt.Sprintf("  • Go Version: %s\n", runtime.Version()))
-	b.WriteString(fmt.Sprintf("  • Goroutines: %d\n", runtime.NumGoroutine()))
-	b.WriteString(fmt.Sprintf("  • CPUs:       %d\n", runtime.NumCPU()))
-	b.WriteString("\n")
-
-	// Scheduler/Engine
-	b.WriteString("📊 Scheduler / Task Engine\n")
-	b.WriteString(fmt.Sprintf("  • Enabled: %v\n", schedEnabled))
-	if schedEnabled {
-		b.WriteString(fmt.Sprintf("  • Workers: %d\n", schedWorkers))
-		b.WriteString(fmt.Sprintf("  • Queue:   %s\n", schedQueue))
-		b.WriteString(fmt.Sprintf("  • Dropped: %d\n", schedDropped))
-		if defTimeout > 0 {
-			b.WriteString(fmt.Sprintf("  • Default Timeout: %s\n", defTimeout))
-		} else {
-			b.WriteString("  • Default Timeout: none\n")
-		}
-		b.WriteString(fmt.Sprintf("  • Retry: %s\n", retryLine))
+	b.WriteString("⏱ scheduler\n")
+	b.WriteString(fmt.Sprintf("  state:     %s\n", schedState))
+	b.WriteString(fmt.Sprintf("  workers:   %d\n", schedWorkers))
+	b.WriteString(fmt.Sprintf("  queue:     %s\n", schedQueue))
+	b.WriteString(fmt.Sprintf("  schedules: %d\n", totalSchedules))
+	if unscopedSchedules > 0 {
+		b.WriteString(fmt.Sprintf("  unscoped:  %d\n", unscopedSchedules))
 	}
 	b.WriteString("\n")
 
-	// Plugins
-	b.WriteString("🔌 Plugins\n")
-	if loaded == 0 {
-		b.WriteString("  • (none)\n")
+	b.WriteString("🔌 plugins\n")
+	if len(plSnap.Plugins) == 0 {
+		b.WriteString("  (none)\n")
 	} else {
-		for _, st := range snap.Plugins {
-			icon := "✅"
-			switch {
-			case st.Quarantined:
-				icon = "🧯"
-			case !st.Enabled:
-				icon = "⛔"
-			case !st.Running:
-				icon = "🟨"
-			}
+		for _, st := range plSnap.Plugins {
+			schedN := perPluginSchedules[st.Name]
 
-			h := "-"
+			// health summary (best-effort)
+			h := "health=na"
 			if st.HasHealthChecker {
-				if st.LastHealth.At.IsZero() {
-					h = "no data"
-				} else if st.LastHealth.Err != "" {
-					if st.Enabled && st.Running && !st.Quarantined {
-						icon = "⚠️"
-					}
-					age := time.Since(st.LastHealth.At)
-					h = fmt.Sprintf("fail (%s ago): %s", durRel(age), st.LastHealth.Err)
-				} else {
-					age := time.Since(st.LastHealth.At)
+				switch {
+				case st.LastHealth.At.IsZero():
+					h = "health=nodata"
+				case st.LastHealth.Err != "":
+					h = "health=fail"
+				default:
 					status := st.LastHealth.Status
 					if status == "" {
 						status = "ok"
 					}
-					h = fmt.Sprintf("%s (%s ago)", status, durRel(age))
+					h = "health=" + status
 				}
 			}
 
-			extra := ""
-			if st.Quarantined && st.QuarantineErr != "" {
-				extra = " | quarantined: " + st.QuarantineErr
+			line := fmt.Sprintf("  - %s en=%v run=%v sched=%d %s", st.Name, st.Enabled, st.Running, schedN, h)
+			if st.Quarantined {
+				q := strings.TrimSpace(st.QuarantineErr)
+				if q == "" {
+					q = "(no reason)"
+				}
+				if !st.QuarantineSince.IsZero() {
+					line += fmt.Sprintf(" | quarantine %s ago: %s", durRel(time.Since(st.QuarantineSince)), q)
+				} else {
+					line += " | quarantine: " + q
+				}
 			}
-			b.WriteString(fmt.Sprintf("  • %s %s — %s%s\n", icon, st.Name, h, extra))
+			b.WriteString(line + "\n")
+		}
+		if unscopedSchedules > 0 {
+			b.WriteString(fmt.Sprintf("  - <unscoped> en=- run=- sched=%d\n", unscopedSchedules))
 		}
 	}
+	b.WriteString("\n")
+
+	b.WriteString("🧵 supervisor\n")
+	b.WriteString("  " + appSupLine + "\n")
+	b.WriteString("  " + plSupLine + "\n")
 
 	if check {
-		b.WriteString("\n")
-		b.WriteString("Refreshed: yes\n")
+		b.WriteString("\nrefreshed: yes\n")
 	}
 
 	_, err := req.Adapter.SendText(ctx, req.Chat, b.String(), &kit.SendOptions{ParseMode: "", DisablePreview: true})

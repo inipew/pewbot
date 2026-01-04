@@ -40,6 +40,8 @@ type App struct {
 	cmdm *CommandManager
 	pm   *PluginManager
 
+	serv *Services
+
 	updates chan kit.Update
 }
 
@@ -176,6 +178,7 @@ func NewApp(cfgPath string) (*App, error) {
 		pprof:   pprofSvc,
 		cmdm:    cmdm,
 		pm:      pm,
+		serv:    serv,
 		updates: make(chan kit.Update, 256),
 	}, nil
 }
@@ -202,6 +205,9 @@ func (a *App) Err() error {
 
 func (a *App) Start(ctx context.Context) error {
 	a.sup = NewSupervisor(ctx, WithLogger(a.log), WithCancelOnError(true))
+	if a.serv != nil {
+		a.serv.AppSupervisor = a.sup
+	}
 	// transactional config reload: validate before commit/publish
 	if a.cfgm != nil {
 		a.cfgm.SetLogger(a.log.With(slog.String("comp", "config")))

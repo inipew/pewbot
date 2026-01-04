@@ -19,6 +19,12 @@ type Supervisor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// Counters are best-effort operational metrics.
+	// - started: total goroutines ever started via this supervisor
+	// - active: goroutines currently running under this supervisor
+	started uint64
+	active  int64
+
 	log         *slog.Logger
 	cancelOnErr bool
 	errOnce     sync.Once
@@ -29,6 +35,13 @@ type Supervisor struct {
 }
 
 type SupervisorOption func(*Supervisor)
+
+// SupervisorCounters exposes best-effort goroutine counters.
+// These are operational signals only (not a synchronization primitive).
+type SupervisorCounters struct {
+	Active  int64  `json:"active"`
+	Started uint64 `json:"started"`
+}
 
 func WithLogger(log *slog.Logger) SupervisorOption {
 	return func(s *Supervisor) { s.log = log }
@@ -68,13 +81,27 @@ func (s *Supervisor) Err() error {
 	return nil
 }
 
+// Counters returns best-effort goroutine counters for this supervisor.
+func (s *Supervisor) Counters() SupervisorCounters {
+	if s == nil {
+		return SupervisorCounters{}
+	}
+	return SupervisorCounters{
+		Active:  atomic.LoadInt64(&s.active),
+		Started: atomic.LoadUint64(&s.started),
+	}
+}
+
 func (s *Supervisor) Go(name string, fn func(ctx context.Context) error) {
 	if fn == nil {
 		return
 	}
+	atomic.AddUint64(&s.started, 1)
+	atomic.AddInt64(&s.active, 1)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer atomic.AddInt64(&s.active, -1)
 
 		// Panic-safe wrapper
 		defer func() {

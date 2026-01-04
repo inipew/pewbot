@@ -231,6 +231,8 @@ func wrapServicesForPlugin(s *Services, caps *capRef) *Services {
 	out := &Services{}
 	// PluginsPort is read-only and is not capability-gated (operational surface).
 	out.Plugins = s.Plugins
+	// AppSupervisor is also operational/read-only.
+	out.AppSupervisor = s.AppSupervisor
 	if s.Scheduler != nil {
 		out.Scheduler = &capScheduler{inner: s.Scheduler, caps: caps}
 	}

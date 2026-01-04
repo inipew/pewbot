@@ -24,7 +24,7 @@ type EnhancedPluginBase struct {
 func (b *EnhancedPluginBase) InitEnhanced(deps core.PluginDeps, pluginName string) {
 	b.InitBase(deps, pluginName)
 	// Helpers are nil-safe; they may wrap nil services in minimal environments.
-	b.schedule = NewScheduleHelper(pluginName, deps.Services)
+	b.schedule = NewScheduleHelper(pluginName, deps)
 	b.notify = NewNotifyHelper(pluginName, deps)
 }
 

@@ -70,6 +70,10 @@ type Services struct {
 	Scheduler SchedulerPort
 	Notifier  NotifierPort
 	Plugins   PluginsPort
+
+	// AppSupervisor is set by the app once started.
+	// It can be nil in minimal/test environments.
+	AppSupervisor *Supervisor
 }
 
 // PluginsPort exposes read-only plugin runtime state for operational commands.

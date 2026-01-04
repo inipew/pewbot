@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"pewbot/internal/core"
+	"pewbot/internal/eventbus"
 )
 
 // ScheduleHelper provides a fluent, plugin-scoped API over core.SchedulerPort.
@@ -17,20 +20,49 @@ import (
 type ScheduleHelper struct {
 	pluginName string
 	svc        core.SchedulerPort
+	bus        eventbus.Bus
+	log        *slog.Logger
 
 	mu    sync.Mutex
 	tasks map[string]struct{} // fullName set
 	ctx   context.Context
 }
 
-func NewScheduleHelper(pluginName string, services *core.Services) *ScheduleHelper {
+// TaskCancelledByPluginEvent is emitted when a scheduled task run is cancelled
+// due to the plugin lifecycle context being canceled (e.g. plugin disabled).
+//
+// This is a best-effort operational signal to help operators understand why a
+// task stopped early.
+type TaskCancelledByPluginEvent struct {
+	Plugin   string        `json:"plugin"`
+	Task     string        `json:"task"`
+	FullName string        `json:"full_name"`
+	Started  time.Time     `json:"started"`
+	Duration time.Duration `json:"duration"`
+	Error    string        `json:"error,omitempty"`
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func NewScheduleHelper(pluginName string, deps core.PluginDeps) *ScheduleHelper {
 	var svc core.SchedulerPort
-	if services != nil {
-		svc = services.Scheduler
+	if deps.Services != nil {
+		svc = deps.Services.Scheduler
+	}
+	lg := deps.Logger
+	if lg == nil {
+		lg = slog.Default()
 	}
 	return &ScheduleHelper{
 		pluginName: pluginName,
 		svc:        svc,
+		bus:        deps.Bus,
+		log:        lg.With(slog.String("plugin", pluginName), slog.String("component", "schedule")),
 		tasks:      map[string]struct{}{},
 	}
 }
@@ -207,18 +239,76 @@ func (b *ScheduleBuilder) Do(job func(ctx context.Context) error) error {
 	if b.parseErr != nil {
 		return b.parseErr
 	}
+	if job == nil {
+		return errors.New("job is nil")
+	}
 	fullName := b.helper.ns(b.name)
+
+	// Ensure scheduled jobs are also bound to the plugin lifecycle context.
+	//
+	// Scheduler/taskengine provide the per-run context (runCtx) which is still the
+	// primary owner of deadlines/timeouts and bot shutdown. We add pluginCtx as an
+	// additional cancellation source so that disabling/stopping a plugin cancels
+	// any in-flight job sooner.
+	//
+	// This is intentionally implemented without spawning an extra goroutine per
+	// task run. On Go 1.22+ context.AfterFunc can register cancellation callbacks
+	// efficiently when pluginCtx is cancelable.
+	pluginCtx := b.helper.ctx
+	wrapped := job
+	if pluginCtx != nil {
+		wrapped = func(runCtx context.Context) error {
+			started := time.Now()
+			var cancelledByPlugin atomic.Bool
+			cctx, cancel := context.WithCancel(runCtx)
+			stop := context.AfterFunc(pluginCtx, func() {
+				// Only mark + cancel if the run is still active.
+				select {
+				case <-runCtx.Done():
+					return
+				default:
+				}
+				cancelledByPlugin.Store(true)
+				cancel()
+			})
+			defer func() {
+				_ = stop() // stop returns whether it stopped the callback; ignore.
+				cancel()
+			}()
+
+			err := job(cctx)
+			// Publish an operator-friendly event if the run was cancelled because the
+			// plugin lifecycle context ended (and not because the scheduler stopped).
+			if cancelledByPlugin.Load() && runCtx.Err() == nil && (errors.Is(err, context.Canceled) || errors.Is(cctx.Err(), context.Canceled)) {
+				ev := TaskCancelledByPluginEvent{
+					Plugin:   b.helper.pluginName,
+					Task:     b.name,
+					FullName: fullName,
+					Started:  started,
+					Duration: time.Since(started),
+					Error:    errString(err),
+				}
+				if b.helper.bus != nil {
+					b.helper.bus.Publish(eventbus.Event{Type: "task.cancelled_by_plugin", Data: ev})
+				}
+				if b.helper.log != nil {
+					b.helper.log.Info("scheduled task cancelled by plugin", slog.String("task", fullName), slog.String("plugin", b.helper.pluginName), slog.Duration("duration", ev.Duration))
+				}
+			}
+			return err
+		}
+	}
 
 	var err error
 	switch b.kind {
 	case kindCron:
-		_, err = b.helper.svc.AddCronOpt(fullName, b.spec, b.timeout, b.overlap, job)
+		_, err = b.helper.svc.AddCronOpt(fullName, b.spec, b.timeout, b.overlap, wrapped)
 	case kindInterval:
-		_, err = b.helper.svc.AddIntervalOpt(fullName, b.interval, b.timeout, b.overlap, job)
+		_, err = b.helper.svc.AddIntervalOpt(fullName, b.interval, b.timeout, b.overlap, wrapped)
 	case kindOnce:
-		_, err = b.helper.svc.AddOnce(fullName, b.at, b.timeout, job)
+		_, err = b.helper.svc.AddOnce(fullName, b.at, b.timeout, wrapped)
 	case kindDaily:
-		_, err = b.helper.svc.AddDaily(fullName, b.timeHHMM, b.timeout, job)
+		_, err = b.helper.svc.AddDaily(fullName, b.timeHHMM, b.timeout, wrapped)
 	default:
 		return fmt.Errorf("unknown schedule kind: %d", b.kind)
 	}

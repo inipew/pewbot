@@ -96,9 +96,13 @@ const defaultEnabledCacheSweepEvery = 64
 // Construction & lifecycle
 //
 
-// NewServiceManager creates a new service manager instance.
-func NewServiceManager(services []string) (*ServiceManager, error) {
-	conn, err := dbus.NewSystemConnectionContext(context.Background())
+// NewServiceManagerContext creates a new service manager instance using ctx for the initial D-Bus connection.
+// If ctx is nil, context.Background() is used.
+func NewServiceManagerContext(ctx context.Context, services []string) (*ServiceManager, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := dbus.NewSystemConnectionContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to systemd: %w", err)
 	}
@@ -111,6 +115,12 @@ func NewServiceManager(services []string) (*ServiceManager, error) {
 		enabledMax:   defaultEnabledCacheMax,
 		enabledSweep: defaultEnabledCacheSweepEvery,
 	}, nil
+}
+
+// NewServiceManager creates a new service manager instance (legacy helper).
+// It uses context.Background() for the connection.
+func NewServiceManager(services []string) (*ServiceManager, error) {
+	return NewServiceManagerContext(context.Background(), services)
 }
 
 // SetEnabledCacheTTL updates the IsEnabled cache TTL.
@@ -388,36 +398,21 @@ func (sm *ServiceManager) BatchRestart(ctx context.Context, serviceNames []strin
 	return sm.batchOperation(ctx, serviceNames, sm.RestartWithResult)
 }
 
+
 func (sm *ServiceManager) batchOperation(
 	ctx context.Context,
 	serviceNames []string,
 	opFunc func(context.Context, string) OperationResult,
 ) BatchResult {
 	results := make([]OperationResult, 0, len(serviceNames))
-	var (
-		mu sync.Mutex
-		wg sync.WaitGroup
-	)
 
-	for _, service := range serviceNames {
-		wg.Add(1)
-		svc := service
-
-		go func() {
-			defer wg.Done()
-
-			svcCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			defer cancel()
-
-			result := opFunc(svcCtx, svc)
-
-			mu.Lock()
-			results = append(results, result)
-			mu.Unlock()
-		}()
+	for _, svc := range serviceNames {
+		// Keep per-unit timeout to avoid hanging on a single D-Bus call.
+		svcCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		result := opFunc(svcCtx, svc)
+		cancel()
+		results = append(results, result)
 	}
-
-	wg.Wait()
 
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].ServiceName < results[j].ServiceName
@@ -441,6 +436,7 @@ func (sm *ServiceManager) batchOperation(
 //
 // Enable/disable & status
 //
+
 
 func (sm *ServiceManager) EnableContext(ctx context.Context, serviceName string) error {
 	sm.mu.RLock()
@@ -774,6 +770,7 @@ func (sm *ServiceManager) GetStatusLiteContext(ctx context.Context, serviceName 
 	}, nil
 }
 
+
 func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceStatus, error) {
 	sm.mu.RLock()
 	services := make([]string, len(sm.services))
@@ -784,50 +781,20 @@ func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceSta
 		return []ServiceStatus{}, nil
 	}
 
-	// Use a small worker pool to avoid spawning one goroutine per service,
-	// which can cause transient memory spikes when the managed list is large.
-	workers := 8
-	if workers > len(services) {
-		workers = len(services)
-	}
-	if workers < 1 {
-		workers = 1
-	}
-
-	jobs := make(chan string, workers*2)
-	results := make(chan ServiceStatus, len(services))
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for svc := range jobs {
-				svcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-				st, err := sm.GetStatusFullContext(svcCtx, svc)
-				cancel()
-
-				if err != nil || st == nil {
-					results <- ServiceStatus{Name: svc, Active: "unknown", SubState: "error", LoadState: "not-found"}
-					continue
-				}
-				results <- *st
-			}
-		}()
-	}
-
-	for _, svc := range services {
-		jobs <- svc
-	}
-	close(jobs)
-
-	wg.Wait()
-	close(results)
-
 	statuses := make([]ServiceStatus, 0, len(services))
-	for st := range results {
-		statuses = append(statuses, st)
+	for _, svc := range services {
+		// Bound each status probe; this is used by chat commands.
+		svcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		st, err := sm.GetStatusFullContext(svcCtx, svc)
+		cancel()
+
+		if err != nil || st == nil {
+			statuses = append(statuses, ServiceStatus{Name: svc, Active: "unknown", SubState: "error", LoadState: "not-found"})
+			continue
+		}
+		statuses = append(statuses, *st)
 	}
+
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Name < statuses[j].Name })
 	return statuses, nil
 }
