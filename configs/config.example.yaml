@@ -1,0 +1,105 @@
+telegram:
+  token: YOUR_BOT_TOKEN
+  owner_user_ids:
+  - 123456789
+  group_log: '123456789'
+  poll_timeout: 10s
+logging:
+  level: INFO
+  console: true
+  file:
+    enabled: true
+    path: ./bot.log
+  telegram:
+    enabled: true
+    thread_id: 0
+    min_level: INFO
+    rate_per_sec: 2
+pprof:
+  enabled: false
+  addr: 127.0.0.1:6060
+  prefix: /debug/pprof/
+  token: ''
+  allow_insecure: false
+  read_timeout: 5s
+  write_timeout: 0s
+  idle_timeout: 120s
+  mutex_profile_fraction: 0
+  block_profile_rate: 0
+  mem_profile_rate: 0
+scheduler:
+  enabled: true
+  timezone: Asia/Jakarta
+
+task_engine:
+  enabled: true
+  workers: 4
+  queue_size: 256
+  default_timeout: 10s
+  max_queue_delay: 30s
+  history_size: 200
+  retry_max: 3
+storage:
+  driver: file
+  path: ./pewbot_store
+notifier:
+  enabled: true
+  workers: 2
+  queue_size: 512
+  rate_per_sec: 3
+  retry_max: 3
+  retry_base: 500ms
+  retry_max_delay: 10s
+  dedup_window: 1m
+  dedup_max_entries: 2000
+  persist_dedup: false
+plugins:
+  echo:
+    enabled: true
+    config:
+      prefix: 'echo: '
+      timeouts:
+        command: 25s
+  system:
+    enabled: true
+  systemd:
+    enabled: true
+    allow:
+    - notify.send
+    - scheduler.write
+    - storage.audit
+    config:
+      prefix: 'svc: '
+      allow_units:
+      - sing-box
+      - caddy
+      - dnscrypt-proxy
+      scheduler:
+        enabled: false
+        task_name: auto_recover
+        schedule: 30s
+      timeouts:
+        command: 15s
+        task: 2m
+        operation: 2s
+      auto_recover:
+        min_down: 3s
+        backoff_base: 5s
+        backoff_max: 5m
+        restart_timeout: 15s
+        fail_alert_streak: 3
+        alert_interval: 10m
+  speedtest:
+    enabled: false
+    config:
+      prefix: 'speedtest: '
+      scheduler:
+        enabled: false
+        task_name: auto_speedtest
+        schedule: '*/30 * * * *'
+      timeouts:
+        command: 2m
+        task: 2m
+        operation: 60s
+      history_file: speedtest_history.json
+      server_count: 3

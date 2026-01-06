@@ -1,6 +1,7 @@
 package eventbus
 
 import (
+	logx "pewbot/pkg/logx"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,13 +30,31 @@ type Bus interface {
 //
 // It intentionally does not own any background goroutines.
 func New() Bus {
-	return &memBus{subs: map[uint64]chan Event{}}
+	return NewWithLogger(logx.Nop())
+}
+
+// NewWithLogger is like New but allows controlling where drop warnings are logged.
+//
+// The bus is intentionally non-blocking; when a subscriber is slow and its buffer
+// fills up, events are dropped. This constructor enables periodic warnings when
+// drops occur.
+func NewWithLogger(log logx.Logger) Bus {
+	if log.IsZero() {
+		log = logx.Nop()
+	}
+	return &memBus{subs: map[uint64]chan Event{}, log: log}
 }
 
 type memBus struct {
 	mu   sync.RWMutex
 	subs map[uint64]chan Event
 	seq  atomic.Uint64
+	log  logx.Logger
+
+	// drop tracking (best-effort; used for periodic warnings)
+	dropsTotal    atomic.Uint64
+	lastLogUnixNS atomic.Int64
+	lastLogged    atomic.Uint64
 }
 
 func (b *memBus) Publish(e Event) {
@@ -59,9 +78,36 @@ func (b *memBus) Publish(e Event) {
 			select {
 			case ch <- e:
 			default:
+				b.noteDrop(len(chs))
 			}
 		}()
 	}
+}
+
+func (b *memBus) noteDrop(subs int) {
+	total := b.dropsTotal.Add(1)
+	log := b.log
+	if log.IsZero() {
+		return
+	}
+
+	// Rate-limit warnings to avoid noisy logs during bursts.
+	const interval = 30 * time.Second
+	now := time.Now().UnixNano()
+	last := b.lastLogUnixNS.Load()
+	if last != 0 && time.Duration(now-last) < interval {
+		return
+	}
+	if !b.lastLogUnixNS.CompareAndSwap(last, now) {
+		return
+	}
+	prev := b.lastLogged.Swap(total)
+	delta := total - prev
+	log.Warn("eventbus dropped events (slow subscriber)",
+		logx.Uint64("dropped_since_last", delta),
+		logx.Uint64("dropped_total", total),
+		logx.Int("subscribers", subs),
+	)
 }
 
 func (b *memBus) Subscribe(buffer int) (<-chan Event, func()) {

@@ -9,9 +9,9 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
+	logx "pewbot/pkg/logx"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,13 +24,13 @@ var migrationsFS embed.FS
 
 type sqliteStore struct {
 	db  *sql.DB
-	log *slog.Logger
+	log logx.Logger
 
 	opCount    atomic.Uint64
 	pruneEvery uint64
 }
 
-func openSQLite(cfg Config, log *slog.Logger) (Store, error) {
+func openSQLite(cfg Config, log logx.Logger) (Store, error) {
 	if strings.TrimSpace(cfg.Path) == "" {
 		return nil, errors.New("sqlite path is required")
 	}

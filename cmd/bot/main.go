@@ -6,36 +6,70 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
-	"pewbot/internal/core"
-	"pewbot/plugins/echo"
-	"pewbot/plugins/speedtest"
-	"pewbot/plugins/system"
-	"pewbot/plugins/systemd"
+	botapp "pewbot/internal/app"
+	"pewbot/internal/plugin/builtin/echo"
+	"pewbot/internal/plugin/builtin/speedtest"
+	"pewbot/internal/plugin/builtin/system"
+	"pewbot/internal/plugin/builtin/systemd"
 )
 
 func main() {
-	var cfgPath string
-	flag.StringVar(&cfgPath, "config", "./config.json", "path to config json")
+	configFlag := flag.String("config", "", "path to config (json/yaml) (optional)")
 	flag.Parse()
+
+	cfgPath := ""
+	if *configFlag != "" {
+		cfgPath = *configFlag
+	} else if env := os.Getenv("PEWBOT_CONFIG"); env != "" {
+		cfgPath = env
+	} else {
+		candidates := []string{
+			"config.local.yaml",
+			"config.local.yml",
+			"config.local.json",
+			"config.yaml",
+			"config.yml",
+			"config.json",
+			"configs/config.local.yaml",
+			"configs/config.local.yml",
+			"configs/config.local.json",
+			"configs/config.yaml",
+			"configs/config.yml",
+			"configs/config.json",
+			"configs/config.example.yaml",
+			"configs/config.example.yml",
+			"configs/config.example.json",
+		}
+		for _, p := range candidates {
+			if _, err := os.Stat(p); err == nil {
+				cfgPath = p
+				break
+			}
+		}
+		if cfgPath == "" {
+			cfgPath = "configs/config.example.yaml"
+		}
+	}
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	reasonCh := make(chan core.StopReason, 1)
+	reasonCh := make(chan botapp.StopReason, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go func() {
 		sig := <-sigCh
-		reason := core.StopUnknown
+		reason := botapp.StopUnknown
 		switch sig {
 		case os.Interrupt:
-			reason = core.StopSIGINT
+			reason = botapp.StopSIGINT
 		case syscall.SIGTERM:
-			reason = core.StopSIGTERM
+			reason = botapp.StopSIGTERM
 		}
 		select { // non-blocking
 		case reasonCh <- reason:
@@ -50,38 +84,41 @@ func main() {
 	}()
 	defer signal.Stop(sigCh)
 
-	app, err := core.NewApp(cfgPath)
+	bot, err := botapp.NewApp(cfgPath)
 	if err != nil {
 		fmt.Println("fatal:", err)
 		os.Exit(1)
 	}
 
-	// Register plugins (tambah plugin cukup New() + Register)
-	app.Plugins().Register(
+	// Register plugins
+	bot.Plugins().Register(
 		echo.New(),
 		system.New(),
-		systemd.New(),
 		speedtest.New(),
 	)
+	if runtime.GOOS == "linux" {
+		bot.Plugins().Register(systemd.New())
+	}
 
-	if err := app.Start(ctx); err != nil {
+	if err := bot.Start(ctx); err != nil {
 		fmt.Println("fatal start:", err)
 		os.Exit(1)
 	}
 
-	reason := core.StopUnknown
+	reason := botapp.StopUnknown
 	select {
 	case <-ctx.Done():
 		select {
 		case reason = <-reasonCh:
 		default:
 		}
-	case <-app.Done():
-		if app.Err() != nil {
-			reason = core.StopFatalError
+	case <-bot.Done():
+		if bot.Err() != nil {
+			reason = botapp.StopFatalError
 		}
 	}
+
 	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = app.Stop(stopCtx, reason)
+	_ = bot.Stop(stopCtx, reason)
 }

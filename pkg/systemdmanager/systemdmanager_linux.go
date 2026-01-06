@@ -398,7 +398,6 @@ func (sm *ServiceManager) BatchRestart(ctx context.Context, serviceNames []strin
 	return sm.batchOperation(ctx, serviceNames, sm.RestartWithResult)
 }
 
-
 func (sm *ServiceManager) batchOperation(
 	ctx context.Context,
 	serviceNames []string,
@@ -436,7 +435,6 @@ func (sm *ServiceManager) batchOperation(
 //
 // Enable/disable & status
 //
-
 
 func (sm *ServiceManager) EnableContext(ctx context.Context, serviceName string) error {
 	sm.mu.RLock()
@@ -769,7 +767,6 @@ func (sm *ServiceManager) GetStatusLiteContext(ctx context.Context, serviceName 
 		StateChange:   parseTimestamp(props, "StateChangeTimestamp"),
 	}, nil
 }
-
 
 func (sm *ServiceManager) GetAllStatusContext(ctx context.Context) ([]ServiceStatus, error) {
 	sm.mu.RLock()

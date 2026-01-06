@@ -3,7 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
-	"log/slog"
+	logx "pewbot/pkg/logx"
 	"strings"
 	"time"
 )
@@ -18,13 +18,13 @@ type Store interface {
 
 // Open initializes the configured store.
 // It returns (nil, nil) if storage is disabled.
-func Open(cfg Config, log *slog.Logger) (Store, error) {
+func Open(cfg Config, log logx.Logger) (Store, error) {
 	driver := strings.ToLower(strings.TrimSpace(cfg.Driver))
 	if driver == "" || driver == "none" {
 		return nil, nil
 	}
-	if log == nil {
-		log = slog.Default()
+	if log.IsZero() {
+		log = logx.Nop()
 	}
 
 	switch driver {

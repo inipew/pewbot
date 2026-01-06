@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"os"
 	"path/filepath"
+	logx "pewbot/pkg/logx"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +22,7 @@ import (
 //
 // The journal is periodically compacted into the snapshot.
 type fileStore struct {
-	log *slog.Logger
+	log logx.Logger
 
 	mu sync.Mutex
 
@@ -40,13 +40,13 @@ type dedupRecord struct {
 	Until int64  `json:"until"`
 }
 
-func openFile(cfg Config, log *slog.Logger) (Store, error) {
+func openFile(cfg Config, log logx.Logger) (Store, error) {
 	path := strings.TrimSpace(cfg.Path)
 	if path == "" {
 		return nil, errors.New("storage.path is required for file driver")
 	}
-	if log == nil {
-		log = slog.Default()
+	if log.IsZero() {
+		log = logx.Nop()
 	}
 
 	dir := filepath.Dir(path)
@@ -81,11 +81,11 @@ func openFile(cfg Config, log *slog.Logger) (Store, error) {
 
 	return &fileStore{
 		log:               log,
-		auditFile:          af,
-		dedupSnapshotPath:  snapPath,
-		dedupJournalFile:   jf,
-		dedup:              dedup,
-		dedupWrites:        0,
+		auditFile:         af,
+		dedupSnapshotPath: snapPath,
+		dedupJournalFile:  jf,
+		dedup:             dedup,
+		dedupWrites:       0,
 	}, nil
 }
 
@@ -148,7 +148,7 @@ func (s *fileStore) PutDedup(ctx context.Context, key string, until time.Time) e
 	if s.dedupWrites%1000 == 0 {
 		// Best-effort compact.
 		if err := s.compactLocked(); err != nil {
-			s.log.Debug("dedup compact failed", slog.Any("err", err))
+			s.log.Debug("dedup compact failed", logx.Any("err", err))
 		}
 	}
 	return nil

@@ -1,7 +1,7 @@
 # pewbot
 
 Modular Telegram bot framework (single operator) dengan:
-- Hot-reload JSON config
+- Hot-reload JSON/YAML config
 - Plugin system + per-plugin timeout (duration string)
 - Scheduler (one-time/interval/daily/weekly/cron) + worker pool + retry + history/statistics
 - Notifier (multi-channel + priority routes + history)
@@ -11,12 +11,14 @@ Modular Telegram bot framework (single operator) dengan:
 
 ## Quickstart
 
-1) Copy config example:
+1) Copy config example (YAML direkomendasikan; JSON juga didukung):
 ```bash
-cp config.example.json config.json
+cp configs/config.example.yaml config.yaml
+# atau:
+# cp configs/config.example.json config.json
 ```
 
-2) Edit `config.json`:
+2) Edit `config.yaml` (atau `config.json`):
 - `telegram.token`: token bot Telegram
 - `telegram.owner_user_ids`: daftar user id operator (boleh lebih dari satu)
 - `telegram.group_log`: (opsional) chat id group/chan untuk sink log Telegram (contoh: `-1001234567890`)
@@ -26,7 +28,7 @@ cp config.example.json config.json
 3) Run:
 ```bash
 go mod tidy
-go run ./cmd/bot -config ./config.json
+go run ./cmd/bot -config ./config.yaml
 ```
 
 ## pprof (optional)
